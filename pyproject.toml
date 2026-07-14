@@ -1,2 +1,42 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fire-moonshot-classifier"
+version = "0.1.0"
+description = "FIRE-moonshot-classifier: trajectory-based flight-stack fingerprinting"
+requires-python = ">=3.12,<3.13"
+authors = [
+    { name = "Gayeon Lee" },
+    { name = "Minjoon Lee" },
+    { name = "Minhyun Cho" }
+]
+
+dependencies = [ 
+    "torch", 
+    "lightgbm", 
+    "matplotlib", 
+    "numpy", 
+    "pandas", 
+    "pymavlink", 
+    "pyulog", 
+    "PyWavelets", 
+    "PyYAML", 
+    "rdp", 
+    "scikit-learn", 
+    "scipy", 
+    "seaborn", 
+    "tqdm", 
+    "tsfresh", 
+]
+
 [project.scripts]
-flightstacktrajlab = "flightstacktrajlab.cli.main:app"
+fire-classifier = "fire_moonshot_classifier.main:main"
+
+# --- setuptools config for src/ layout ---
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
