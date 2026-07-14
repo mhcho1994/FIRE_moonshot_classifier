@@ -3,8 +3,8 @@ import matplotlib
 import matplotlib.pyplot as plt
 from rdp import rdp
 from pathlib import Path
-import deprecated.drone_classifier_modules.src.config as config
-import deprecated.drone_classifier_modules.src.kinematic_processor as kinematic_processor
+import fire_moonshot_classifier.datamanager.config as config
+import fire_moonshot_classifier.processor.kinematic_processor as kinematic_processor
 
 def generate_rdp_plots(raw_data, epsilon, output_prefix, title_prefix):
     """

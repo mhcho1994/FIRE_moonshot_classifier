@@ -6,10 +6,12 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 's
 
 from pathlib import Path
 
-import data_extractor
-import flight_segmenter
-import deprecated.drone_classifier_modules.scripts.generate_visualizations as generate_visualizations
-import kinematic_processor
+from fire_moonshot_classifier.datamanager import data_extractor
+from fire_moonshot_classifier.processor import flight_segmenter
+import sys, os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'visualization')))
+import generate_visualizations
+from fire_moonshot_classifier.processor import kinematic_processor
 
 parser = argparse.ArgumentParser(description="Test feature builder parameters on specific logs.")
 parser.add_argument('--files', nargs='*', help='List of log files to process. If not provided, default test files will be used.')

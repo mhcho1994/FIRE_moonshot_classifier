@@ -6,8 +6,8 @@ matplotlib.use('Agg')
 
 # Add src to sys.path to import data_extractor and rdp_utils
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
-from data_extractor import parse_px4_ulog, parse_ardu_bin
-from rdp_utils import generate_rdp_plots
+from fire_moonshot_classifier.datamanager.data_extractor import parse_px4_ulog, parse_ardu_bin
+from fire_moonshot_classifier.processor.rdp_utils import generate_rdp_plots
 import pathlib
 
 def main():

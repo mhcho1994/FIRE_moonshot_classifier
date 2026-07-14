@@ -1,12 +1,12 @@
 import os
 from pathlib import Path
 
-import deprecated.drone_classifier_modules.src.config as config
-import deprecated.drone_classifier_modules.src.flight_segmenter as flight_segmenter
-import deprecated.drone_classifier_modules.src.kinematic_processor as kinematic_processor
+import fire_moonshot_classifier.datamanager.config as config
+import fire_moonshot_classifier.processor.flight_segmenter as flight_segmenter
+import fire_moonshot_classifier.processor.kinematic_processor as kinematic_processor
 import numpy as np
 # Import our modular pipeline components
-from deprecated.drone_classifier_modules.src.data_extractor import parse_ardu_bin, parse_px4_ulog, parse_real_csv
+from fire_moonshot_classifier.datamanager.data_extractor import parse_ardu_bin, parse_px4_ulog, parse_real_csv
 
 
 def process_dataset_folder(base_folder, is_sitl=True, measurement_type='mocap', max_runs=None):

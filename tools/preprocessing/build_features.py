@@ -7,9 +7,9 @@ import numpy as np
 # Add src/ to the python path so modules can be imported directly
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 
-import config
-import dataset_manager
-from feature_builder import compute_dwt_statistics, pad_sequences
+from fire_moonshot_classifier.datamanager import config
+from fire_moonshot_classifier.datamanager import dataset_manager
+from fire_moonshot_classifier.processor.feature_builder import compute_dwt_statistics, pad_sequences
 
 
 def main():

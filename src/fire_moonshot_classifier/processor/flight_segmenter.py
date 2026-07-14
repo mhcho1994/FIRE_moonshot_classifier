@@ -1,4 +1,4 @@
-import deprecated.drone_classifier_modules.src.config as config
+import fire_moonshot_classifier.datamanager.config as config
 import numpy as np
 
 # ==============================================================================
@@ -153,8 +153,8 @@ def extract_segments(features_dict, dt=None, min_turn_duration=None,
 
 
 if __name__ == "__main__":
-    import deprecated.drone_classifier_modules.src.data_extractor as data_extractor
-    import deprecated.drone_classifier_modules.src.kinematic_processor as kinematic_processor
+    import fire_moonshot_classifier.datamanager.data_extractor as data_extractor
+    import fire_moonshot_classifier.processor.kinematic_processor as kinematic_processor
     import matplotlib.pyplot as plt
 
     # 1. Parse raw data

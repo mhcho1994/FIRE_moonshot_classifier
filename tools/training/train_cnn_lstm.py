@@ -13,9 +13,9 @@ from torch.utils.data import DataLoader, TensorDataset
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 
-import config
+from fire_moonshot_classifier.datamanager import config
 # Import common project evaluation utilities
-from evaluation_utils import (plot_confusion_matrix, plot_pca_2d_projection,
+from fire_moonshot_classifier.training.evaluation_utils import (plot_confusion_matrix, plot_pca_2d_projection,
                               print_detailed_prediction_map)
 
 

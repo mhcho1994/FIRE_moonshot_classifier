@@ -2,7 +2,7 @@ import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
 import pywt
-import deprecated.drone_classifier_modules.src.config as config
+import fire_moonshot_classifier.datamanager.config as config
 
 
 def plot_3d_trajectory_comparison(x1, y1, z1, x2, y2, z2, labels, title, save_path, colors=None):

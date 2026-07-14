@@ -1,7 +1,7 @@
 import numpy as np
 from scipy.interpolate import interp1d
 from scipy.signal import savgol_filter
-import deprecated.drone_classifier_modules.src.config as config
+import fire_moonshot_classifier.datamanager.config as config
 
 def compute_kinematics_pca(raw_data, target_hz=20, window_sec=2.0, overlap_sec=1):
     """
@@ -190,7 +190,7 @@ def compute_kinematics_diff(raw_data_dict, window_len=200, poly_order=3):
 
 
 if __name__ == "__main__":
-    import deprecated.drone_classifier_modules.src.data_extractor as data_extractor
+    import fire_moonshot_classifier.datamanager.data_extractor as data_extractor
     import matplotlib.pyplot as plt
 
     # 1. Parse raw data

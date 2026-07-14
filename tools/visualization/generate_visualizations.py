@@ -15,12 +15,12 @@ matplotlib.use('Agg')
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 
-import config
-import kinematic_processor
-from data_extractor import parse_px4_ulog, parse_ardu_bin, parse_real_csv
-from kinematic_processor import compute_kinematics_diff
-from flight_segmenter import extract_segments, get_segmentation_details
-from visualization_utils import (
+from fire_moonshot_classifier.datamanager import config
+from fire_moonshot_classifier.processor import kinematic_processor
+from fire_moonshot_classifier.datamanager.data_extractor import parse_px4_ulog, parse_ardu_bin, parse_real_csv
+from fire_moonshot_classifier.processor.kinematic_processor import compute_kinematics_diff
+from fire_moonshot_classifier.processor.flight_segmenter import extract_segments, get_segmentation_details
+from fire_moonshot_classifier.postprocessor.visualization_utils import (
     plot_3d_trajectory_comparison,
     plot_state_variables,
     plot_full_trajectory_with_spans,
