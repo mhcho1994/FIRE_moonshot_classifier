@@ -1,0 +1,12 @@
+
+# Keep directory structure, ignore contents
+data/**
+models/**
+configs/**
+tests/**
+
+# Keep placeholder files
+!data/.gitkeep
+!models/.gitkeep
+!configs/.gitkeep
+!tests/.gitkeep
