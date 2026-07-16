@@ -18,6 +18,52 @@ from fire_moonshot_classifier.training.evaluation_utils import (plot_confusion_m
                               print_detailed_prediction_map)
 
 
+def save_real_flight_results(y_true, y_pred, runs, output_dir=Path("results/svm_statistics")):
+    """Save real-flight prediction statistics and per-sample results as text."""
+    label_map = {0: "PX4", 1: "ArduPilot", 2: "Cogni"}
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / "real_flight_classification.txt"
+
+    correct_count = int(np.sum(y_pred == y_true))
+    lines = [
+        "SVM Real Flight Classification Results",
+        "=" * 85,
+        f"Accuracy: {(correct_count / len(y_true)) * 100:.2f}% "
+        f"({correct_count}/{len(y_true)})",
+        "",
+        "Classification Report",
+        "-" * 85,
+        classification_report(
+            y_true,
+            y_pred,
+            labels=[0, 1],
+            target_names=["PX4", "ArduPilot"],
+            zero_division=0,
+        ).rstrip(),
+        "",
+        "Detailed Prediction Map",
+        "-" * 85,
+        f"{'No.':<4} | {'Run Folder':<30} | {'True Label':<12} | "
+        f"{'Prediction':<12} | {'Status'}",
+        "-" * 85,
+    ]
+
+    for i, (true_label, pred_label, run_name) in enumerate(
+        zip(y_true, y_pred, runs), start=1
+    ):
+        true_name = label_map.get(int(true_label), "Unknown")
+        pred_name = label_map.get(int(pred_label), "Unknown")
+        status = "Match" if true_label == pred_label else "Fail"
+        lines.append(
+            f"{i:<4} | {str(run_name):<30} | {true_name:<12} | "
+            f"{pred_name:<12} | {status}"
+        )
+
+    lines.append("-" * 85)
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"[Info] Saved real flight classification results to '{output_path}'")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train SVM Model on SITL features and evaluate on Real Data.")
     parser.add_argument("--sitl-folder", type=str, default=config.SITL_FOLDER, help="Name of the SITL folder to load features from.")
@@ -98,6 +144,7 @@ def main():
         print("\n[Real Data Classification Report]")
         # print(classification_report(y_real, y_real_pred, labels=[0, 1, 2], target_names=['PX4', 'ArduPilot', 'Cogni'], zero_division=0))
         print(classification_report(y_real, y_real_pred, labels=[0, 1], target_names=['PX4', 'ArduPilot'], zero_division=0))    # Quick Fix for the current dataset imbalance (no Cogni samples)
+        save_real_flight_results(y_real, y_real_pred, runs_real)
 
         # Call visualization functions (passing the SVM model name)
         # plot_confusion_matrix(y_real, y_real_pred, target_names=['PX4', 'ArduPilot', 'Cogni'], model_name="SVM")

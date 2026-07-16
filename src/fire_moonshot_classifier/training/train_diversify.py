@@ -1,9 +1,10 @@
 """
 DIVERSIFY-based drone autopilot classifier  (PX4 vs ArduPilot)
 
-Input : 2-second sliding windows of 7 kinematic features resampled to 50 Hz
-        fixed shape (N_FEAT=7, WIN_LEN=100)
-        Features: vh, speed_xy, ah, curvature, yaw_rate, yaw_angular_accel, speed×curvature
+Input : build_features.py cache (X_seq), converted to 2-second sliding
+        windows at 50 Hz with shape
+        (N_FEAT=len(config.TARGET_FEATURES), WIN_LEN=100).
+        Current features: XY-Accel, XY-Jerk, Curvature.
 
 Class y : 0 = ArduPilot,  1 = PX4
 Latent domain d' : auto-discovered (K=5) by DIVERSIFY cosine k-means
@@ -14,6 +15,7 @@ Strategy B : time-scale / agility invariance — kinematic features already hand
 import os
 import sys
 import json
+import argparse
 import random
 from collections import Counter
 from contextlib import contextmanager
@@ -21,14 +23,29 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Function
 from torch.utils.data import DataLoader
 from scipy.spatial.distance import cdist
-from sklearn.metrics import classification_report
+from sklearn.metrics import (
+    ConfusionMatrixDisplay,
+    classification_report,
+    confusion_matrix,
+)
+from sklearn.decomposition import PCA
 import wandb
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+SRC_DIR = PROJECT_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from fire_moonshot_classifier.datamanager import config
 
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "processor"))
@@ -40,6 +57,8 @@ FEAT_HZ         = 50
 WIN_SEC         = 2.0
 WIN_LEN         = int(WIN_SEC * FEAT_HZ)   # 100 samples
 HOP_LEN         = WIN_LEN // 2             # 50 samples = 50 % overlap
+# Legacy raw-log training uses seven kinematic channels. main() replaces this
+# with the X_seq channel count when training from the project feature cache.
 N_FEAT          = 7
 NUM_CLASSES     = 2                        # 0=ArduPilot, 1=PX4
 LATENT_DOMAIN_N = 5
@@ -51,7 +70,7 @@ ALPHA           = 1.0
 ALPHA1          = 1.0
 LAM             = 0.0
 LOCAL_EPOCH     = 3
-MAX_EPOCH       = 50
+MAX_EPOCH       = 100
 # CKPT_INTERVAL   = 10   # save a checkpoint every N rounds (for double-descent curve)
 LR              = 1e-3
 LR_DECAY1       = 0.1
@@ -61,7 +80,7 @@ BETA1           = 0.9
 BATCH_SIZE      = 128
 SEED            = 42
 MIN_WIN         = 30
-REALFLIGHT_DIR  = Path(__file__).parent.parent.parent / "data/realflight"
+REALFLIGHT_DIR  = PROJECT_ROOT / "data"
 OOD_PCTILE = 95   # 95th-percentile of SITL-val kNN distances → threshold
 KNN_K      = 5    # k-th nearest neighbor for OOD scoring
 
@@ -95,8 +114,8 @@ elif torch.backends.mps.is_available():
 else:
     DEVICE = torch.device("cpu")
 
-PX4_FOLDER  = "../../data/px4_logs"
-ARDU_FOLDER = "../../data/ardu_logs"
+PX4_FOLDER  = PROJECT_ROOT / "data/px4_logs"
+ARDU_FOLDER = PROJECT_ROOT / "data/ardu_logs"
 TEST_RATIO  = 0.2
 
 WANDB_PROJECT = "drone-firmware-classifier"
@@ -151,8 +170,8 @@ class TemporalAttentionPooling(nn.Module):
     
 class FlightFeaturizer(nn.Module):
     """
-    1D-CNN on fixed (B, N_FEAT, WIN_LEN) = (B, 7, 100) input.
-      Conv1(7→32,  k=7) + MaxPool(2) → (B, 32, 50)
+    1D-CNN on fixed (B, N_FEAT, WIN_LEN) input.
+      Conv1(N_FEAT→32, k=7) + MaxPool(2) → (B, 32, 50)
       Conv2(32→64, k=5) + MaxPool(2) → (B, 64, 25)
       Conv3(64→128,k=3)              → (B, 128, 25)
       AdaptiveAvgPool1d(1)           → (B, 128)
@@ -522,6 +541,114 @@ def load_sitl_windows(file_list):
                          np.array(all_d, dtype=np.int64))
 
 
+def _sequence_length(sequence):
+    """Return the unpadded length of an (L, F) sequence from X_seq."""
+    non_padding = np.any(np.abs(sequence) > 1e-12, axis=1)
+    if not np.any(non_padding):
+        return 0
+    return int(np.flatnonzero(non_padding)[-1] + 1)
+
+
+def _windows_from_sequence(sequence):
+    """Convert one cached (L, F) turn segment to fixed CNN windows."""
+    length = _sequence_length(sequence)
+    if length < MIN_WIN:
+        return []
+
+    sequence = np.asarray(sequence[:length], dtype=np.float32)
+    if length < WIN_LEN:
+        sequence = np.pad(
+            sequence,
+            ((0, WIN_LEN - length), (0, 0)),
+            mode="edge",
+        )
+    return _slide_windows(sequence)
+
+
+def load_cached_windows(cache_path, segment_indices=None):
+    """
+    Load the project's build_features.py cache.
+
+    The project cache uses 0=PX4 and 1=ArduPilot, while the existing Diversify
+    implementation uses 0=ArduPilot and 1=PX4. Labels are converted here so the
+    model and its evaluation code retain their original convention.
+
+    Splitting must happen before this function is called. That keeps windows
+    from the same turn segment in only one of train/validation/test.
+    """
+    cached = np.load(cache_path)
+    if "X_seq" not in cached or "y" not in cached:
+        raise KeyError(f"{cache_path} must contain 'X_seq' and 'y'")
+
+    sequences = cached["X_seq"]
+    labels = cached["y"].astype(np.int64)
+    if sequences.ndim != 3:
+        raise ValueError(f"Expected X_seq shape (N, L, F), got {sequences.shape}")
+    if sequences.shape[2] != N_FEAT:
+        raise ValueError(
+            f"Cache has {sequences.shape[2]} features, but model expects {N_FEAT}. "
+            "Rebuild the feature cache after checking config.TARGET_FEATURES."
+        )
+
+    if segment_indices is None:
+        segment_indices = np.arange(len(labels))
+
+    all_x, all_y, all_d = [], [], []
+    for segment_idx in np.asarray(segment_indices, dtype=np.int64):
+        project_label = int(labels[segment_idx])
+        if project_label not in (0, 1):
+            continue
+        diversify_label = 1 - project_label
+        for window in _windows_from_sequence(sequences[segment_idx]):
+            all_x.append(window)
+            all_y.append(diversify_label)
+            all_d.append(int(segment_idx))
+
+    return FlightDataset(
+        all_x,
+        np.asarray(all_y, dtype=np.int64),
+        np.asarray(all_d, dtype=np.int64),
+    )
+
+
+def split_cached_segments(labels, groups=None, test_ratio=TEST_RATIO, val_ratio=0.15):
+    """Split at run level when cache groups exist, otherwise by segment."""
+    labels = np.asarray(labels)
+    if groups is not None:
+        groups = np.asarray(groups)
+        unique_groups = np.unique(groups)
+        np.random.shuffle(unique_groups)
+        n_test = max(1, int(len(unique_groups) * test_ratio))
+        remaining = unique_groups[n_test:]
+        n_val = max(1, int(len(remaining) * val_ratio))
+        test_groups = unique_groups[:n_test]
+        val_groups = remaining[:n_val]
+        train_groups = remaining[n_val:]
+        return (
+            np.flatnonzero(np.isin(groups, train_groups)),
+            np.flatnonzero(np.isin(groups, val_groups)),
+            np.flatnonzero(np.isin(groups, test_groups)),
+        )
+
+    train_idx, val_idx, test_idx = [], [], []
+
+    for cls in (0, 1):
+        cls_idx = np.flatnonzero(labels == cls)
+        np.random.shuffle(cls_idx)
+        n_test = max(1, int(len(cls_idx) * test_ratio)) if len(cls_idx) > 2 else 0
+        remaining = cls_idx[n_test:]
+        n_val = max(1, int(len(remaining) * val_ratio)) if len(remaining) > 2 else 0
+        test_idx.extend(cls_idx[:n_test])
+        val_idx.extend(remaining[:n_val])
+        train_idx.extend(remaining[n_val:])
+
+    return (
+        np.asarray(train_idx, dtype=np.int64),
+        np.asarray(val_idx, dtype=np.int64),
+        np.asarray(test_idx, dtype=np.int64),
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Evaluation
 # ══════════════════════════════════════════════════════════════════════════════
@@ -805,14 +932,521 @@ def evaluate_realflight(model, csv_files, banks, threshold):
     return results
 
 
+@torch.no_grad()
+def evaluate_cached_realflight(model, cache_paths, banks, threshold):
+    """Evaluate and aggregate cached real-flight turn segments by run folder."""
+    grouped = {}
+    for cache_path in cache_paths:
+        cached = np.load(cache_path)
+        if not {"X_seq", "y", "runs"}.issubset(cached.files):
+            print(f"  [SKIP] {cache_path.name} (X_seq/y/runs missing)")
+            continue
+
+        for sequence, project_label, run_name in zip(
+            cached["X_seq"], cached["y"], cached["runs"]
+        ):
+            if int(project_label) not in (0, 1):
+                continue
+            windows = _windows_from_sequence(sequence)
+            if not windows:
+                continue
+            key = str(run_name)
+            entry = grouped.setdefault(
+                key,
+                {"windows": [], "label": 1 - int(project_label)},
+            )
+            if entry["label"] != 1 - int(project_label):
+                raise ValueError(f"Conflicting labels found for real-flight run {key}")
+            entry["windows"].extend(windows)
+
+    model.eval()
+    results = []
+    for run_name, entry in sorted(grouped.items()):
+        x = torch.stack(entry["windows"]).to(DEVICE)
+        z_list = model.extract_ood_features(x)
+        distances = _knn_score(z_list, banks)
+        accepted = distances <= threshold
+        n_total = len(x)
+        n_accepted = int(accepted.sum())
+        n_rejected = n_total - n_accepted
+        quorum_ok = (
+            n_accepted >= MIL_MIN_VALID
+            and n_accepted / n_total >= MIL_MIN_FRAC
+        )
+
+        if quorum_ok:
+            logits = model.classifier(z_list[1])
+            predictions = logits[accepted].argmax(dim=1)
+            predicted_label = int(torch.mode(predictions).values)
+            prediction = "PX4" if predicted_label == 1 else "ArduPilot"
+            n_px4 = int((predictions == 1).sum())
+            n_ardu = n_accepted - n_px4
+        else:
+            predicted_label = None
+            prediction = "Unknown"
+            n_px4 = n_ardu = 0
+
+        true_label = int(entry["label"])
+        ground_truth = "PX4" if true_label == 1 else "ArduPilot"
+        results.append(
+            {
+                "file": run_name,
+                "ground_truth": ground_truth,
+                "prediction": prediction,
+                "correct": predicted_label == true_label,
+                "knn_dist": round(float(distances.mean()), 4),
+                "n_windows": n_total,
+                "n_accepted": n_accepted,
+                "n_rejected": n_rejected,
+                "n_px4": n_px4,
+                "n_ardu": n_ardu,
+                "reject_rate": round(n_rejected / n_total, 4),
+            }
+        )
+        print(
+            f"  {run_name:<40} true={ground_truth:<11} "
+            f"pred={prediction:<11} valid={n_accepted}/{n_total}"
+        )
+
+    model.train()
+    return results
+
+
+def save_evaluation_report(
+    output_path,
+    y_true,
+    y_pred,
+    best_val_acc,
+    best_test_acc,
+    ood_threshold,
+    sitl_false_reject,
+    real_results,
+):
+    """Save SITL and real-flight evaluation results in a readable text file."""
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    sitl_report = classification_report(
+        y_true,
+        y_pred,
+        labels=[0, 1],
+        target_names=["ArduPilot", "PX4"],
+        zero_division=0,
+    ).rstrip()
+    sitl_accuracy = (
+        float(np.mean(np.asarray(y_true) == np.asarray(y_pred)))
+        if y_true
+        else 0.0
+    )
+
+    labeled_results = [
+        result
+        for result in real_results
+        if result.get("ground_truth") in ("PX4", "ArduPilot")
+    ]
+    real_correct = sum(bool(result.get("correct")) for result in labeled_results)
+    real_accuracy = (
+        real_correct / len(labeled_results) if labeled_results else 0.0
+    )
+
+    lines = [
+        "CNN + DIVERSIFY Evaluation Results",
+        "=" * 115,
+        "",
+        "SITL Evaluation",
+        "-" * 115,
+        f"Best validation accuracy : {best_val_acc * 100:.2f}%",
+        f"Best-round test accuracy : {best_test_acc * 100:.2f}%",
+        f"Final test accuracy      : {sitl_accuracy * 100:.2f}% "
+        f"({sum(a == b for a, b in zip(y_true, y_pred))}/{len(y_true)})",
+        f"OOD threshold            : {ood_threshold:.6f}",
+        f"SITL false rejection     : {sitl_false_reject * 100:.2f}%",
+        "",
+        "SITL Classification Report",
+        "-" * 115,
+        sitl_report,
+        "",
+        "Real Flight Evaluation",
+        "-" * 115,
+        f"Accuracy: {real_accuracy * 100:.2f}% "
+        f"({real_correct}/{len(labeled_results)})",
+        f"Unknown predictions: "
+        f"{sum(r.get('prediction') == 'Unknown' for r in real_results)}",
+        "",
+        f"{'No.':<4} | {'Run Folder':<40} | {'True Label':<12} | "
+        f"{'Prediction':<12} | {'Status':<7} | {'Valid Windows':<15} | "
+        f"{'kNN Dist.':>9}",
+        "-" * 115,
+    ]
+
+    for index, result in enumerate(real_results, start=1):
+        status = "Match" if result.get("correct") else "Fail"
+        if result.get("prediction") == "Unknown":
+            status = "Unknown"
+        valid_windows = (
+            f"{result.get('n_accepted', 0)}/{result.get('n_windows', 0)}"
+        )
+        lines.append(
+            f"{index:<4} | {result.get('file', 'Unknown'):<40} | "
+            f"{result.get('ground_truth', 'Unknown'):<12} | "
+            f"{result.get('prediction', 'Unknown'):<12} | "
+            f"{status:<7} | {valid_windows:<15} | "
+            f"{result.get('knn_dist', float('nan')):>9.4f}"
+        )
+
+    lines.append("-" * 115)
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"  Text report: {output_path}")
+
+
+@torch.no_grad()
+def save_diversify_figures(
+    model,
+    test_loader,
+    y_true,
+    y_pred,
+    real_results,
+    save_dir,
+    permutation_repeats=10,
+):
+    """
+    Save a confusion matrix and channel-wise permutation sensitivity plot.
+
+    Sensitivity is the decrease in SITL test accuracy after replacing one
+    complete feature channel with the same channel from randomly selected
+    samples. Repeating the permutation provides a mean and standard deviation.
+    """
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    label_to_index = {"ArduPilot": 0, "PX4": 1, "Unknown": 2}
+    real_true = [
+        label_to_index[result["ground_truth"]]
+        for result in real_results
+        if result.get("ground_truth") in ("ArduPilot", "PX4")
+    ]
+    real_pred = [
+        label_to_index.get(result.get("prediction"), 2)
+        for result in real_results
+        if result.get("ground_truth") in ("ArduPilot", "PX4")
+    ]
+    cm = confusion_matrix(real_true, real_pred, labels=[0, 1, 2])
+    display = ConfusionMatrixDisplay(
+        confusion_matrix=cm,
+        display_labels=["ArduPilot", "PX4", "Unknown"],
+    )
+    fig, ax = plt.subplots(figsize=(7, 6))
+    display.plot(cmap=plt.cm.Blues, ax=ax, colorbar=False)
+    ax.set_title(
+        "CNN + DIVERSIFY Real-Flight Confusion Matrix",
+        fontweight="bold",
+    )
+    fig.tight_layout()
+    confusion_path = save_dir / "confusion_matrix.png"
+    fig.savefig(confusion_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    all_x, all_y = [], []
+    for batch in test_loader:
+        all_x.append(batch[0].cpu().float())
+        all_y.append(batch[1].cpu().long())
+    x_test = torch.cat(all_x)
+    labels = torch.cat(all_y).numpy()
+    baseline_accuracy = float(
+        np.mean(np.asarray(y_true, dtype=np.int64) == np.asarray(y_pred))
+    )
+
+    def predict_in_batches(inputs):
+        predictions = []
+        model.eval()
+        for start in range(0, len(inputs), BATCH_SIZE):
+            logits = model.predict(
+                inputs[start:start + BATCH_SIZE].to(DEVICE)
+            )
+            predictions.append(logits.argmax(dim=1).cpu())
+        return torch.cat(predictions).numpy()
+
+    rng = torch.Generator().manual_seed(SEED)
+    sensitivity = np.zeros((x_test.shape[1], permutation_repeats), dtype=float)
+    for feature_idx in range(x_test.shape[1]):
+        for repeat_idx in range(permutation_repeats):
+            permuted = x_test.clone()
+            order = torch.randperm(len(x_test), generator=rng)
+            permuted[:, feature_idx, :] = x_test[order, feature_idx, :]
+            permuted_predictions = predict_in_batches(permuted)
+            permuted_accuracy = float(np.mean(permuted_predictions == labels))
+            sensitivity[feature_idx, repeat_idx] = (
+                baseline_accuracy - permuted_accuracy
+            )
+
+    feature_names = list(config.TARGET_FEATURES)
+    if len(feature_names) != x_test.shape[1]:
+        feature_names = [
+            f"Feature {index + 1}" for index in range(x_test.shape[1])
+        ]
+    mean_drop = sensitivity.mean(axis=1) * 100
+    std_drop = sensitivity.std(axis=1) * 100
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    bars = ax.bar(
+        feature_names,
+        mean_drop,
+        yerr=std_drop,
+        capsize=5,
+        color=["tab:green", "tab:orange", "tab:blue"][:len(feature_names)],
+        alpha=0.85,
+    )
+    ax.axhline(0, color="black", linewidth=0.8)
+    ax.set_ylabel("Test accuracy decrease (percentage points)")
+    ax.set_title(
+        "CNN + DIVERSIFY Feature Sensitivity\n"
+        f"Permutation importance ({permutation_repeats} repeats)",
+        fontweight="bold",
+    )
+    ax.grid(axis="y", linestyle="--", alpha=0.5)
+    ax.bar_label(bars, labels=[f"{value:.2f}" for value in mean_drop], padding=3)
+    fig.tight_layout()
+    sensitivity_path = save_dir / "feature_sensitivity.png"
+    fig.savefig(sensitivity_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"  Confusion matrix: {confusion_path}")
+    print(f"  Feature sensitivity: {sensitivity_path}")
+
+
+@torch.no_grad()
+def save_knn_distribution_figures(
+    model,
+    train_loader,
+    test_loader,
+    real_cache_paths,
+    banks,
+    threshold,
+    save_dir,
+):
+    """
+    Project L1 OOD features to 2D while retaining their original-space kNN score.
+
+    PCA is fitted only on SITL training features. The displayed color and
+    in/OOD status always use the 32-dimensional kNN distance from _knn_score;
+    distance is never recomputed in the PCA plane.
+    """
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    model.eval()
+
+    def collect_loader(loader, source):
+        features, distances, labels = [], [], []
+        for batch in loader:
+            x = batch[0].to(DEVICE).float()
+            z_l1 = model.extract_ood_features(x)[0]
+            features.append(z_l1.cpu().numpy())
+            distances.append(
+                _knn_score([z_l1], banks).cpu().numpy()
+            )
+            labels.append(batch[1].cpu().numpy())
+        if not features:
+            return None
+        return {
+            "source": source,
+            "features": np.concatenate(features),
+            "distances": np.concatenate(distances),
+            "labels": np.concatenate(labels),
+        }
+
+    datasets = [
+        collect_loader(train_loader, "SITL Train"),
+        collect_loader(test_loader, "SITL Test"),
+    ]
+    for cache_path in real_cache_paths:
+        real_dataset = load_cached_windows(cache_path)
+        if len(real_dataset) == 0:
+            continue
+        datasets.append(
+            collect_loader(
+                _make_loader(real_dataset, shuffle=False),
+                f"Real: {cache_path.stem.replace('_features', '')}",
+            )
+        )
+    datasets = [dataset for dataset in datasets if dataset is not None]
+    if not datasets:
+        print("  [Warning] No latent features available for kNN plots.")
+        return
+
+    train_data = datasets[0]
+    pca = PCA(n_components=2)
+    train_2d = pca.fit_transform(train_data["features"])
+
+    # Fix PCA sign ambiguity so PX4 (label 1) lies in the positive direction
+    # from ArduPilot (label 0), making plots from separate runs comparable.
+    train_labels = train_data["labels"]
+    class_delta = (
+        train_2d[train_labels == 1].mean(axis=0)
+        - train_2d[train_labels == 0].mean(axis=0)
+    )
+    axis_signs = np.where(class_delta < 0, -1.0, 1.0)
+    train_data["coordinates"] = train_2d * axis_signs
+    for dataset in datasets[1:]:
+        dataset["coordinates"] = (
+            pca.transform(dataset["features"]) * axis_signs
+        )
+
+    all_distances = np.concatenate(
+        [dataset["distances"] for dataset in datasets]
+    )
+    color_max = max(
+        float(np.percentile(all_distances, 99)),
+        float(threshold),
+        1e-8,
+    )
+    source_markers = ["o", "^", "*", "P", "D", "s"]
+
+    # Plot 1: continuous original-space kNN distance on the PCA plane.
+    fig, ax = plt.subplots(figsize=(11, 7))
+    scatter_for_colorbar = None
+    for index, dataset in enumerate(datasets):
+        coordinates = dataset["coordinates"]
+        marker = source_markers[index % len(source_markers)]
+        scatter_for_colorbar = ax.scatter(
+            coordinates[:, 0],
+            coordinates[:, 1],
+            c=dataset["distances"],
+            cmap="turbo",
+            vmin=0,
+            vmax=color_max,
+            marker=marker,
+            s=90 if dataset["source"].startswith("Real") else 28,
+            alpha=0.8 if dataset["source"].startswith("Real") else 0.45,
+            edgecolors="black" if dataset["source"].startswith("Real") else "none",
+            linewidths=0.4,
+            label=dataset["source"],
+        )
+    colorbar = fig.colorbar(scatter_for_colorbar, ax=ax)
+    colorbar.set_label("kNN distance in 32D L1 latent space")
+    colorbar.ax.axhline(
+        min(threshold, color_max),
+        color="white",
+        linewidth=2,
+    )
+    ax.set_xlabel(
+        f"Latent PC1 ({pca.explained_variance_ratio_[0] * 100:.1f}%)"
+    )
+    ax.set_ylabel(
+        f"Latent PC2 ({pca.explained_variance_ratio_[1] * 100:.1f}%)"
+    )
+    ax.set_title(
+        "CNN + DIVERSIFY kNN Distance Distribution\n"
+        f"Original 32D distance; OOD threshold={threshold:.3f}",
+        fontweight="bold",
+    )
+    ax.grid(linestyle="--", alpha=0.4)
+    ax.legend(loc="center left", bbox_to_anchor=(1.15, 0.5))
+    fig.tight_layout()
+    distance_path = save_dir / "knn_distance_distribution.png"
+    fig.savefig(distance_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    # Plot 2: class colors with threshold-based In/OOD markers.
+    class_colors = {0: "tab:orange", 1: "tab:green"}
+    class_names = {0: "ArduPilot", 1: "PX4"}
+    fig, ax = plt.subplots(figsize=(11, 7))
+    for source_index, dataset in enumerate(datasets):
+        coordinates = dataset["coordinates"]
+        accepted = dataset["distances"] <= threshold
+        marker = source_markers[source_index % len(source_markers)]
+        for class_label in (0, 1):
+            in_mask = accepted & (dataset["labels"] == class_label)
+            if np.any(in_mask):
+                ax.scatter(
+                    coordinates[in_mask, 0],
+                    coordinates[in_mask, 1],
+                    c=class_colors[class_label],
+                    marker=marker,
+                    s=90 if dataset["source"].startswith("Real") else 28,
+                    alpha=0.75,
+                    edgecolors="black" if dataset["source"].startswith("Real") else "none",
+                    linewidths=0.4,
+                    label=(
+                        f"{dataset['source']} {class_names[class_label]} (In)"
+                    ),
+                )
+        rejected = ~accepted
+        if np.any(rejected):
+            ax.scatter(
+                coordinates[rejected, 0],
+                coordinates[rejected, 1],
+                c="red",
+                marker="X",
+                s=100 if dataset["source"].startswith("Real") else 45,
+                edgecolors="black",
+                linewidths=0.5,
+                label=f"{dataset['source']} (OOD)",
+            )
+
+    ax.set_xlabel(
+        f"Latent PC1 ({pca.explained_variance_ratio_[0] * 100:.1f}%)"
+    )
+    ax.set_ylabel(
+        f"Latent PC2 ({pca.explained_variance_ratio_[1] * 100:.1f}%)"
+    )
+    ax.set_title(
+        "CNN + DIVERSIFY kNN In-Distribution / OOD Status\n"
+        f"Threshold={threshold:.3f}",
+        fontweight="bold",
+    )
+    ax.grid(linestyle="--", alpha=0.4)
+    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=8)
+    fig.tight_layout()
+    status_path = save_dir / "knn_ood_status.png"
+    fig.savefig(status_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"  kNN distance distribution: {distance_path}")
+    print(f"  kNN OOD status: {status_path}")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Main
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
+    global MAX_EPOCH, LOCAL_EPOCH, BATCH_SIZE, LR, N_FEAT
+
+    parser = argparse.ArgumentParser(
+        description="Train the CNN+DIVERSIFY model on project feature caches."
+    )
+    parser.add_argument("--sitl-folder", default=config.SITL_FOLDER)
+    parser.add_argument("--epochs", type=int, default=MAX_EPOCH)
+    parser.add_argument("--local-epochs", type=int, default=LOCAL_EPOCH)
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
+    parser.add_argument("--lr", type=float, default=LR)
+    parser.add_argument(
+        "--no-wandb",
+        action="store_true",
+        help="Train locally without uploading metrics or artifacts.",
+    )
+    args = parser.parse_args()
+
+    MAX_EPOCH = args.epochs
+    LOCAL_EPOCH = args.local_epochs
+    BATCH_SIZE = args.batch_size
+    LR = args.lr
+
     torch.manual_seed(SEED); random.seed(SEED); np.random.seed(SEED)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M")
+    sitl_cache = config.CACHE_DIR / f"{args.sitl_folder}_features.npz"
+    if not sitl_cache.exists():
+        raise FileNotFoundError(
+            f"Feature cache not found: {sitl_cache}\n"
+            "Run `python3 tools/preprocessing/build_features.py` first."
+        )
+    with np.load(sitl_cache) as cached:
+        if "X_seq" not in cached:
+            raise KeyError(f"{sitl_cache} does not contain X_seq")
+        N_FEAT = int(cached["X_seq"].shape[2])
+        cached_labels = cached["y"].copy()
+        cached_runs = cached["runs"].copy() if "runs" in cached else None
 
     _cfg = {
         "feat_hz": FEAT_HZ, "win_sec": WIN_SEC, "win_len": WIN_LEN,
@@ -832,9 +1466,10 @@ def main():
     if wandb.run is None:
         run = wandb.init(
             project=WANDB_PROJECT,
-            name=f"diversify_feat7_{ts}",
+            name=f"cnn_diversify_{ts}",
             job_type="train",
             config=_cfg,
+            mode="disabled" if args.no_wandb else None,
         )
     else:
         # called from sweep agent — run already initialised, just sync config
@@ -843,7 +1478,7 @@ def main():
     run.log_code(str(Path(__file__).parent))
 
     print(f"\n{'='*70}")
-    print(f"  DIVERSIFY  feat7@50Hz  2s-windows  ({ts})")
+    print(f"  CNN + DIVERSIFY  cached sequences  ({ts})")
     print(f"  WIN_LEN={WIN_LEN}  N_FEAT={N_FEAT}  BOTTLENECK={BOTTLENECK_DIM}")
     print(f"  LATENT_K={LATENT_DOMAIN_N}  epochs={MAX_EPOCH}×{LOCAL_EPOCH}  lr={LR}")
     print(f"  alpha={ALPHA}  alpha1={ALPHA1}  lam={LAM}  lr_decay1={LR_DECAY1}")
@@ -851,28 +1486,28 @@ def main():
     print(f"  device: {DEVICE}")
     print(f"{'='*70}\n")
 
-    # ── train/test split ──────────────────────────────────────────────────────
-    px4_files  = [(p, 1) for p in sorted(Path(PX4_FOLDER).glob("*.ulg"))]
-    ardu_files = [(p, 0) for p in sorted(Path(ARDU_FOLDER).glob("*.bin"))]
-    random.shuffle(px4_files); random.shuffle(ardu_files)
-    px4_te  = max(1, int(len(px4_files)  * TEST_RATIO)) if len(px4_files)  > 1 else 0
-    ardu_te = max(1, int(len(ardu_files) * TEST_RATIO)) if len(ardu_files) > 1 else 0
-    train_files = px4_files[px4_te:]  + ardu_files[ardu_te:]
-    test_files  = px4_files[:px4_te]  + ardu_files[:ardu_te]
-    print(f"Files — train PX4:{len(px4_files)-px4_te}  Ardu:{len(ardu_files)-ardu_te}"
-          f"  test PX4:{px4_te}  Ardu:{ardu_te}")
+    # Split turn segments before window generation to prevent leakage between
+    # train, validation and test sets.
+    train_idx, val_idx, test_idx = split_cached_segments(
+        cached_labels, groups=cached_runs
+    )
+    split_level = "run" if cached_runs is not None else "turn segment"
+    print(
+        f"Segments ({split_level} split) — train:{len(train_idx)}  "
+        f"val:{len(val_idx)}  test:{len(test_idx)}"
+    )
+    print("Loading cached train windows...")
+    train_ds = load_cached_windows(sitl_cache, train_idx)
+    print("Loading cached validation windows...")
+    val_ds = load_cached_windows(sitl_cache, val_idx)
+    print("Loading cached test windows...")
+    test_ds = load_cached_windows(sitl_cache, test_idx)
 
-    # ── feature extraction ────────────────────────────────────────────────────
-    print("Loading train windows...")
-    train_ds_full = load_sitl_windows(train_files)
-    print("Loading test windows...")
-    test_ds = load_sitl_windows(test_files)
-
-    N   = len(train_ds_full)
-    idx = np.random.permutation(N)
-    val_n    = max(1, int(N * 0.15))
-    val_ds   = FlightDataset.subset(train_ds_full, idx[:val_n])
-    train_ds = FlightDataset.subset(train_ds_full, idx[val_n:])
+    if min(len(train_ds), len(val_ds), len(test_ds)) == 0:
+        raise RuntimeError(
+            "At least one dataset split produced zero windows. Check X_seq, "
+            "WIN_LEN/MIN_WIN, and the class counts in the feature cache."
+        )
 
     n_px4  = int((train_ds.labels == 1).sum())
     n_ardu = int((train_ds.labels == 0).sum())
@@ -898,7 +1533,9 @@ def main():
 
     best_val_acc  = 0.0
     best_test_acc = 0.0
-    model_path    = f"diversify_feat7_{ts}.pt"
+    model_dir = PROJECT_ROOT / "models"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    model_path = model_dir / f"cnn_diversify_{ts}.pt"
 
     # ── training loop ─────────────────────────────────────────────────────────
     for rnd in range(MAX_EPOCH):
@@ -976,7 +1613,6 @@ def main():
             y_t = b[1].tolist() if isinstance(b[1], torch.Tensor) else list(b[1])
             y_true.extend(y_t); y_pred.extend(p)
     print(classification_report(y_true, y_pred, target_names=["ArduPilot", "PX4"]))
-
     # ── kNN OOD calibration ───────────────────────────────────────────────────
     print(f"\n{'='*70}\n  kNN OOD Calibration  (k={KNN_K})")
     bank_feats, _ = build_knn_bank(model, train_ns_ld)
@@ -986,26 +1622,63 @@ def main():
     wandb.run.summary["ood/threshold"]         = threshold
     wandb.run.summary["ood/sitl_false_reject"] = sitl_false_reject
 
-    # ── real flight evaluation ────────────────────────────────────────────────
-    csv_files = [p for p in sorted(REALFLIGHT_DIR.glob("*.csv"))
-                 if "_raw" not in p.name]
-    print(f"\n{'='*70}\n  Real Flight Evaluation ({len(csv_files)} files)\n{'='*70}\n")
-    results = evaluate_realflight(model, csv_files, bank_feats, threshold)
+    # ── real flight evaluation from the same project caches ──────────────────
+    real_cache_paths = [
+        config.CACHE_DIR / f"{folder}_features.npz"
+        for folder in config.REAL_FLIGHT_FOLDERS
+    ]
+    real_cache_paths = [path for path in real_cache_paths if path.exists()]
+    print(
+        f"\n{'='*70}\n  Real Flight Evaluation "
+        f"({len(real_cache_paths)} caches)\n{'='*70}\n"
+    )
+    results = evaluate_cached_realflight(
+        model, real_cache_paths, bank_feats, threshold
+    )
+    save_diversify_figures(
+        model,
+        test_ld,
+        y_true,
+        y_pred,
+        real_results=results,
+        save_dir=PROJECT_ROOT / "results" / "diversify_figs",
+    )
+    save_knn_distribution_figures(
+        model,
+        train_ns_ld,
+        test_ld,
+        real_cache_paths,
+        bank_feats,
+        threshold,
+        save_dir=PROJECT_ROOT / "results" / "diversify_figs",
+    )
 
     ardu    = sum(1 for r in results if r["prediction"] == "ArduPilot")
     px4     = sum(1 for r in results if r["prediction"] == "PX4")
     unknown = sum(1 for r in results if r["prediction"] == "Unknown")
 
-    labeled = [(r, _filename_label(r["file"])) for r in results
-               if _filename_label(r["file"]) is not None]
-    correct  = sum(1 for r, gt in labeled if r["prediction"] == gt)
+    labeled = [r for r in results if r["ground_truth"] in ("PX4", "ArduPilot")]
+    correct = sum(1 for r in labeled if r["correct"])
     accuracy = correct / len(labeled) if labeled else 0.0
     print(f"\n  Total:{len(results)}  ArduPilot:{ardu}  PX4:{px4}  Unknown:{unknown}"
           f"  Accuracy:{correct}/{len(labeled)} ({accuracy*100:.1f}%)")
 
-    out = f"diversify_feat7_realflight_{ts}.json"
-    with open(out, "w") as f:
+    statistics_dir = PROJECT_ROOT / "results" / "diversify_statistics"
+    statistics_dir.mkdir(parents=True, exist_ok=True)
+    out = statistics_dir / f"cnn_diversify_realflight_{ts}.json"
+    with open(out, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
+    text_report_path = statistics_dir / "real_flight_classification.txt"
+    save_evaluation_report(
+        text_report_path,
+        y_true=y_true,
+        y_pred=y_pred,
+        best_val_acc=best_val_acc,
+        best_test_acc=best_test_acc,
+        ood_threshold=threshold,
+        sitl_false_reject=sitl_false_reject,
+        real_results=results,
+    )
     print(f"  Results: {out}\n  Model:   {model_path}")
 
     # log to history (so the sweep's Bayes optimizer reliably reads the metric)
@@ -1027,8 +1700,8 @@ def main():
         columns=["file", "ground_truth", "prediction", "correct", "px4_prob", "knn_dist",
                  "n_windows", "n_accepted", "n_rejected", "n_px4",
                  "n_ardu", "reject_rate"],
-        data=[[r["file"], _filename_label(r["file"]) or "Unknown",
-               r["prediction"], _filename_label(r["file"]) == r["prediction"],
+        data=[[r["file"], r["ground_truth"],
+               r["prediction"], r["correct"],
                r.get("px4_prob"), r["knn_dist"],
                r["n_windows"], r["n_accepted"], r["n_rejected"],
                r["n_px4"], r["n_ardu"], r["reject_rate"]] for r in results],
@@ -1036,7 +1709,7 @@ def main():
     wandb.log({"realflight/results": realflight_table})
 
     artifact = wandb.Artifact(
-        name="diversify_feat7",
+        name="cnn_diversify",
         type="model",
         metadata={
             "timestamp":         ts,
@@ -1046,8 +1719,8 @@ def main():
             "sitl_false_reject": sitl_false_reject,
         },
     )
-    artifact.add_file(model_path)
-    artifact.add_file(out)
+    artifact.add_file(str(model_path))
+    artifact.add_file(str(out))
     run.log_artifact(artifact)
     wandb.finish()
 

@@ -22,7 +22,7 @@ def main():
 
     # 1. Process SITL Logs
     print("\n[Info] Executing ETL Pipeline for SITL data...")
-    X_sitl_ts, _, y_sitl, _ = dataset_manager.process_dataset_folder(config.SITL_FOLDER, is_sitl=True, max_runs=args.max_runs)
+    X_sitl_ts, _, y_sitl, runs_sitl = dataset_manager.process_dataset_folder(config.SITL_FOLDER, is_sitl=True, max_runs=args.max_runs)
     
     if len(X_sitl_ts) > 0:
         print(f"[Info] Extracting DWT features for SITL data...")
@@ -30,7 +30,13 @@ def main():
         X_sitl_seq = pad_sequences(X_sitl_ts)       # Pad sequences for 1D-CNN
 
         cache_file = cache_dir / f"{config.SITL_FOLDER}_features.npz"
-        np.savez(cache_file, X=X_sitl_dwt, X_seq=X_sitl_seq, y=y_sitl)
+        np.savez(
+            cache_file,
+            X=X_sitl_dwt,
+            X_seq=X_sitl_seq,
+            y=y_sitl,
+            runs=np.asarray(runs_sitl),
+        )
         print(f"[Success] Cached SITL features (Shape: {X_sitl_dwt.shape})")
     else:
         print("[Warning] No valid SITL features extracted.")

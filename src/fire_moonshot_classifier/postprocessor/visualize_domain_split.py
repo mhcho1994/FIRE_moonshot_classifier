@@ -1,7 +1,7 @@
 """
 Domain split visualization: (a) Initial vs (b) Our method (DIVERSIFY) vs (c) Predicted Classes
 
-(a) Raw feat7 statistics (mean+std, 14-dim) → t-SNE
+(a) Cached X_seq feature statistics (mean+std, 2*N_FEAT-dim) → t-SNE
     Color = source domain (SITL-PX4 / SITL-Ardu / Real-PX4 / Real-Ardu)
     Shows the original Sim2Real domain gap.
 
@@ -32,34 +32,36 @@ import matplotlib.patches as mpatches
 from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "training"))
 import train_diversify as td
 
 SEED        = 42
-MAX_SITL    = 1500        # samples per SITL class
-REALFLIGHT  = td.REALFLIGHT_DIR
+MAX_SITL    = 1500        # cached windows per SITL class
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+MODEL_DIR    = PROJECT_ROOT / "models"
+OUTPUT_DIR   = PROJECT_ROOT / "results" / "diversify_figs"
 
 random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 
 
 # ── choose checkpoint ─────────────────────────────────────────────────────────
 def _select_checkpoint():
-    """CLI arg, else interactive picker over local diversify_*.pt files."""
+    """CLI arg, else interactive picker over checkpoints in models/."""
     if len(sys.argv) > 1:
         p = Path(sys.argv[1])
         if not p.exists():
             raise FileNotFoundError(p)
         return p
 
-    pts = sorted(Path(".").glob("diversify_feat7_*.pt"))
+    pts = sorted(MODEL_DIR.glob("*.pt"))
     if not pts:
-        pts = sorted(Path(".").glob("diversify_*.pt"))
-    if not pts:
-        raise FileNotFoundError("No .pt checkpoint found. Pass path explicitly.")
+        raise FileNotFoundError(
+            f"No .pt checkpoint found in {MODEL_DIR}. Pass a model path explicitly."
+        )
 
     print(f"\nAvailable checkpoints ({len(pts)}):")
     for i, p in enumerate(pts):
-        print(f"  [{i}] {p.name}")
+        print(f"  [{i}] {p.relative_to(PROJECT_ROOT)}")
     default_idx = len(pts) - 1
     while True:
         raw = input(f"Select checkpoint [0-{len(pts)-1}, default={default_idx}]: ").strip()
@@ -76,65 +78,69 @@ def _select_checkpoint():
 
 MODEL_PATH = _select_checkpoint()
 _ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
-OUT_PATH   = f"domain_split_{MODEL_PATH.stem}_{_ts}.png"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+OUT_PATH   = OUTPUT_DIR / f"domain_split_{MODEL_PATH.stem}_{_ts}.png"
 print(f"Model:  {MODEL_PATH}")
 print(f"Output: {OUT_PATH}")
 
-# real flight label mapping (by filename prefix)
-def _real_label(fname):
-    """Return 1 (PX4) or 0 (ArduPilot) based on filename."""
-    n = fname.lower()
-    if "px4" in n:
-        return 1
-    return 0   # ardupilot / cognipilot / rosbag → treat as ArduPilot
+# ── 1. Load the same cached turn segments used by train_diversify.py ──────────
+print("\nLoading model metadata and cached turn segments …")
+sd = torch.load(MODEL_PATH, map_location=td.DEVICE)
+model_n_feat = int(sd["featurizer.block1.0.weight"].shape[1])
+td.N_FEAT = model_n_feat
+td.LATENT_DOMAIN_N = int(sd["dclassifier.fc.weight"].shape[0])
+
+sitl_cache = td.config.CACHE_DIR / f"{td.config.SITL_FOLDER}_features.npz"
+real_caches = [
+    td.config.CACHE_DIR / f"{folder}_features.npz"
+    for folder in td.config.REAL_FLIGHT_FOLDERS
+]
+cache_paths = [sitl_cache, *real_caches]
+missing = [path for path in cache_paths if not path.exists()]
+if missing:
+    raise FileNotFoundError(
+        "Required feature cache(s) not found:\n  "
+        + "\n  ".join(str(path) for path in missing)
+        + "\nRun `python3 tools/preprocessing/build_features.py` first."
+    )
+
+for cache_path in cache_paths:
+    with np.load(cache_path) as cached:
+        if "X_seq" not in cached:
+            raise KeyError(f"{cache_path} does not contain X_seq")
+        cache_n_feat = int(cached["X_seq"].shape[2])
+    if cache_n_feat != model_n_feat:
+        raise ValueError(
+            f"{cache_path.name} has {cache_n_feat} features, but "
+            f"{MODEL_PATH.name} expects {model_n_feat}."
+        )
 
 
-# ── 1. Load SITL windows ──────────────────────────────────────────────────────
-print("Loading SITL files …")
-px4_files  = [(p, 1) for p in sorted(Path(td.PX4_FOLDER).glob("*.ulg"))]
-ardu_files = [(p, 0) for p in sorted(Path(td.ARDU_FOLDER).glob("*.bin"))]
+def _sample_class(dataset, label, max_n=None):
+    """Return cached windows for one class using DIVERSIFY's label convention."""
+    indices = np.flatnonzero(dataset.labels == label)
+    if max_n is not None and len(indices) > max_n:
+        indices = np.random.choice(indices, max_n, replace=False)
+    return [dataset.x[i] for i in indices], [label] * len(indices)
 
-def _load_sitl(file_list, max_n):
-    all_x, all_y = [], []
-    for path, label in file_list:
-        fn = td.process_px4_flight_data if label == 1 else td.process_ardu_flight_data
-        result = fn(str(path))
-        if result is None:
-            continue
-        feat = result[4]
-        if feat is None or len(feat) < td.MIN_WIN:
-            continue
-        wins = td._slide_windows(feat)
-        for w in wins:
-            all_x.append(w); all_y.append(label)
-        if len(all_x) >= max_n:
-            break
-    idx = np.random.choice(len(all_x), min(max_n, len(all_x)), replace=False)
-    return [all_x[i] for i in idx], [all_y[i] for i in idx]
 
-px4_x,  px4_y  = _load_sitl(px4_files,  MAX_SITL)
-ardu_x, ardu_y = _load_sitl(ardu_files, MAX_SITL)
-print(f"  SITL PX4: {len(px4_x)}  SITL Ardu: {len(ardu_x)}")
+sitl_ds = td.load_cached_windows(sitl_cache)
+px4_x, px4_y = _sample_class(sitl_ds, label=1, max_n=MAX_SITL)
+ardu_x, ardu_y = _sample_class(sitl_ds, label=0, max_n=MAX_SITL)
+print(f"  SITL cache: {sitl_cache.name}")
+print(f"    PX4: {len(px4_x)}  Ardu: {len(ardu_x)}")
 
-# ── 2. Load real flight windows ───────────────────────────────────────────────
-print("Loading real flight files …")
-real_csv = [p for p in sorted(REALFLIGHT.glob("*.csv")) if "_raw" not in p.name]
+real_x, real_y = [], []
+for cache_path in real_caches:
+    dataset = td.load_cached_windows(cache_path)
+    real_x.extend(dataset.x)
+    real_y.extend(dataset.labels.tolist())
+    print(f"  Real cache: {cache_path.name} — windows: {len(dataset)}")
 
-real_x, real_y, real_names = [], [], []
-for csv_path in real_csv:
-    label = _real_label(csv_path.name)
-    segs = td.process_rosbag_flight_data(str(csv_path))
-    for seg in segs:
-        feat = seg["data"][4]
-        if feat is None or len(feat) < td.MIN_WIN:
-            continue
-        wins = td._slide_windows(feat)
-        for w in wins:
-            real_x.append(w)
-            real_y.append(label)
-            real_names.append(csv_path.name)
-
-print(f"  Real PX4: {sum(1 for y in real_y if y==1)}  Real Ardu: {sum(1 for y in real_y if y==0)}")
+print(
+    f"    Real PX4: {sum(y == 1 for y in real_y)}  "
+    f"Real Ardu: {sum(y == 0 for y in real_y)}"
+)
 
 # ── 3. Source-domain labels (4 groups) ───────────────────────────────────────
 # 0=SITL-PX4  1=SITL-Ardu  2=Real-PX4  3=Real-Ardu
@@ -149,8 +155,15 @@ is_real = np.array([False]*len(px4_x) + [False]*len(ardu_x) + [True]*len(real_x)
 
 N = len(all_x)
 print(f"Total windows: {N}  (SITL:{len(px4_x)+len(ardu_x)}  Real:{len(real_x)})")
+if N < 2:
+    raise RuntimeError(
+        f"Only {N} usable cached window(s) were created. "
+        "Check X_seq, WIN_LEN, MIN_WIN, and cache labels."
+    )
 
-# ── 4. (a) Raw features: mean+std over time → 14-dim ─────────────────────────
+tsne_perplexity = min(30, N - 1)
+
+# ── 4. (a) Cached features: mean+std over time → 2*N_FEAT dimensions ──────────
 print("\nComputing raw feat statistics (for panel a) …")
 raw_feats = np.zeros((N, td.N_FEAT * 2), dtype=np.float32)
 for i, w in enumerate(all_x):
@@ -159,16 +172,17 @@ for i, w in enumerate(all_x):
     raw_feats[i, td.N_FEAT:]  = arr.std(axis=1)
 
 print("Running t-SNE on raw features …")
-tsne_a = TSNE(n_components=2, perplexity=30, max_iter=1000,
+tsne_a = TSNE(n_components=2, perplexity=tsne_perplexity, max_iter=1000,
               random_state=SEED, n_jobs=-1)
 emb_a  = tsne_a.fit_transform(raw_feats)
 print("  done.")
 
 # ── 5. Load trained model ─────────────────────────────────────────────────────
 print(f"\nLoading model: {MODEL_PATH}")
-sd = torch.load(MODEL_PATH, map_location=td.DEVICE)
-td.LATENT_DOMAIN_N = sd["dclassifier.fc.weight"].shape[0]
-print(f"  LATENT_DOMAIN_N={td.LATENT_DOMAIN_N} (from checkpoint)")
+print(
+    f"  N_FEAT={td.N_FEAT}, LATENT_DOMAIN_N={td.LATENT_DOMAIN_N} "
+    "(from checkpoint)"
+)
 model = td.DiversifyFlight().to(td.DEVICE)
 model.load_state_dict(sd)
 model.eval()
@@ -222,7 +236,7 @@ pseudo_dom = cdist(all_fea, initc, "cosine").argmin(1)
 print(f"  Pseudo-domain dist: {dict(Counter(pseudo_dom.tolist()))}")
 
 print("\nRunning t-SNE on bottleneck features …")
-tsne_b = TSNE(n_components=2, perplexity=30, max_iter=1000,
+tsne_b = TSNE(n_components=2, perplexity=tsne_perplexity, max_iter=1000,
               random_state=SEED, n_jobs=-1)
 emb_b  = tsne_b.fit_transform(btn_feats)
 print("  done.")
@@ -327,6 +341,10 @@ ax.legend(handles=class_patches + cls_handles, fontsize=8, loc="upper right", fr
 ax.set_title("(c) True Classes", fontsize=13, fontweight="bold")
 ax.set_xlabel("t-SNE 1"); ax.set_ylabel("t-SNE 2")
 ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
+
+for ax in axes:
+    ax.set_axisbelow(True)
+    ax.grid(True, linestyle="--", linewidth=0.6, alpha=0.4)
 
 plt.suptitle("DIVERSIFY Latent Space Analysis", fontsize=16, fontweight="bold", y=1.05)
 plt.tight_layout()

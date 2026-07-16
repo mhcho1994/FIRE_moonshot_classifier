@@ -29,6 +29,7 @@ dependencies = [
     "seaborn", 
     "tqdm", 
     "tsfresh", 
+    "wandb",
 ]
 
 [project.scripts]
