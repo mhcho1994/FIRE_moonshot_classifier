@@ -58,7 +58,7 @@ The repository provides the following models and experiments:
 - Python `3.12`
 - Git
 
-The supported Python version declared in `pyproject.toml` is `>=3.12,<3.13`.
+The supported Python version declared in `pyproject.toml` is `>=3.10,<3.13`.
 
 ### GPU Support
 
@@ -161,20 +161,43 @@ The following CSV column names are supported:
 Edit `src/fire_moonshot_classifier/datamanager/config.py` to change dataset
 names or the selected feature set.
 
-## Preprocessing and Training
+## Command-Line Interface
 
-Run all commands from the repository root.
+Installing the project exposes the `fireclassify` command.
+
+```bash
+python -m pip install -e .
+fireclassify --help
+```
+
+The packaged CLI keeps the current preprocessing and training algorithms. The
+scripts under `tools/` remain available as backward-compatible wrappers.
 
 ### 1. Build Feature Caches
 
+Build the default SITL and real-flight datasets configured in
+`datamanager/config.py`:
+
 ```bash
-python tools/preprocessing/build_features.py
+fireclassify feature-build
 ```
 
-Limit the number of processed runs for a quick smoke test:
+Build one dataset with explicit inputs and target features:
 
 ```bash
-python tools/preprocessing/build_features.py --max-runs 2
+fireclassify feature-build \
+  --logs data/260615_sitl_logs \
+  --source sitl \
+  --target-features XY-Accel XY-Jerk Curvature
+```
+
+Comma-separated feature names are also accepted. If spaces follow commas,
+quote the value or pass each feature as a separate argument as shown above.
+
+Limit processing for a smoke test or choose a portable cache directory:
+
+```bash
+fireclassify feature-build --max-runs 2 --cache-dir artifacts/cache
 ```
 
 Generated caches are stored at:
@@ -184,53 +207,111 @@ src/fire_moonshot_classifier/cache/<dataset>_features.npz
 ```
 
 Each cache contains DWT features in `X`, time-series features in `X_seq`, class
-labels in `y`, and source run information in `runs`.
+labels in `y`, source run information in `runs`, and the selected channel order
+in `feature_names` (older caches without `feature_names` remain supported).
 
-### 2. Train Baseline Models
+### 2. Train the SVM Baseline
 
-SVM:
+Both the positional model command and the requested flag alias are supported:
 
 ```bash
-python tools/training/train_svm.py
+fireclassify train svm
+fireclassify train --svm
 ```
 
-1D-CNN:
+Select caches explicitly when they were written outside the default directory:
+
+```bash
+fireclassify train svm \
+  --cache-dir artifacts/cache \
+  --sitl-folder 260615_sitl_logs \
+  --real-folders 260527_flight_logs_1 260527_flight_logs_2
+```
+
+Use `--no-real` to skip real-flight evaluation. The existing experimental CNN
+and CNN-LSTM scripts are still invoked directly:
 
 ```bash
 python tools/training/train_cnn.py
-```
-
-CNN-LSTM:
-
-```bash
 python tools/training/train_cnn_lstm.py
 ```
-
-Add `--no-real` to any of these commands to skip real-flight evaluation.
 
 ### 3. Train the DIVERSIFY Model
 
 ```bash
-python -m fire_moonshot_classifier.training.train_diversify
+fireclassify train diversify
+fireclassify train --diversify
 ```
 
 Example with explicit hyperparameters:
 
 ```bash
-python -m fire_moonshot_classifier.training.train_diversify \
+fireclassify train diversify \
   --epochs 100 \
   --local-epochs 3 \
   --batch-size 128 \
-  --lr 0.001
+  --lr 0.001 \
+  --no-wandb
 ```
 
 View all available options:
 
 ```bash
-python -m fire_moonshot_classifier.training.train_diversify --help
+fireclassify train diversify --help
 ```
 
-### 4. Evaluate a DIVERSIFY Checkpoint
+### 4. FireTrack Computer-Vision Integration
+
+[FireTrack](https://github.com/ashreeku/fire-moonshot) writes reconstructed
+trajectories to `triangulation/<run>/trajectory.csv`. Its CSV schema includes
+`time_s`, `x_smooth`, `y_smooth`, and `z_smooth`, which maps directly to this
+project's `vision` input mode.
+
+Build one evaluation cache from labeled FireTrack outputs by repeating
+`--trajectory LABEL=CSV`:
+
+```bash
+# Put the SITL training cache in the same cache directory.
+fireclassify feature-build \
+  --logs data/260615_sitl_logs \
+  --source sitl \
+  --cache-dir artifacts/cache
+
+fireclassify feature-build \
+  --trajectory px4=/work/triangulation/px4_run_001/trajectory.csv \
+  --trajectory ardupilot=/work/triangulation/ardu_run_001/trajectory.csv \
+  --dataset-name firetrack_eval \
+  --measurement-type vision \
+  --cache-dir artifacts/cache
+```
+
+Then include that cache in SVM or DIVERSIFY real-flight evaluation:
+
+```bash
+fireclassify train svm \
+  --cache-dir artifacts/cache \
+  --real-folders firetrack_eval
+
+fireclassify train diversify \
+  --cache-dir artifacts/cache \
+  --real-folders firetrack_eval \
+  --no-wandb
+```
+
+The label in `LABEL=CSV` is ground truth used by the current supervised
+evaluation workflow; accepted labels are `px4`, `ardupilot` (or `ardu`), and
+`cogni`. An unlabeled standalone prediction artifact is outside the current
+three-command workflow and is not implied by this adapter.
+
+The legacy commands continue to work:
+
+```bash
+python3 tools/preprocessing/build_features.py
+python3 tools/training/train_svm.py
+python3 src/fire_moonshot_classifier/training/train_diversify.py
+```
+
+### 5. Evaluate a DIVERSIFY Checkpoint
 
 Evaluate a saved checkpoint on real-flight data:
 
@@ -338,10 +419,8 @@ container:
 python -m fire_moonshot_classifier.evaluation.eval_diversify --no-wandb
 ```
 
-> The `main.py` module connected to the `fire-classifier` console entry point
-> does not currently contain executable application logic. Use
-> `release-run`/`release-shell` and invoke the appropriate Python module
-> directly instead of running the release image's default entry point.
+The release image can invoke the same `fireclassify` commands after the project
+has been installed.
 
 ### Docker Environment Variables
 

@@ -6,7 +6,8 @@ build-backend = "setuptools.build_meta"
 name = "fire-moonshot-classifier"
 version = "0.1.0"
 description = "FIRE-moonshot-classifier: trajectory-based flight-stack fingerprinting"
-requires-python = ">=3.12,<3.13"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
 authors = [
     { name = "Gayeon Lee" },
     { name = "Minjoon Lee" },
@@ -33,7 +34,7 @@ dependencies = [
 ]
 
 [project.scripts]
-fire-classifier = "fire_moonshot_classifier.main:main"
+fireclassify = "fire_moonshot_classifier.cli:main"
 
 # --- setuptools config for src/ layout ---
 [tool.setuptools]

@@ -1409,13 +1409,20 @@ def save_knn_distribution_figures(
 # Main
 # ══════════════════════════════════════════════════════════════════════════════
 
-def main():
+def main(argv=None):
     global MAX_EPOCH, LOCAL_EPOCH, BATCH_SIZE, LR, N_FEAT
 
     parser = argparse.ArgumentParser(
         description="Train the CNN+DIVERSIFY model on project feature caches."
     )
     parser.add_argument("--sitl-folder", default=config.SITL_FOLDER)
+    parser.add_argument("--cache-dir", type=Path, default=config.CACHE_DIR)
+    parser.add_argument(
+        "--real-folders",
+        nargs="+",
+        default=config.REAL_FLIGHT_FOLDERS,
+        help="Real-flight cache dataset names used for final evaluation.",
+    )
     parser.add_argument("--epochs", type=int, default=MAX_EPOCH)
     parser.add_argument("--local-epochs", type=int, default=LOCAL_EPOCH)
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
@@ -1425,7 +1432,7 @@ def main():
         action="store_true",
         help="Train locally without uploading metrics or artifacts.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     MAX_EPOCH = args.epochs
     LOCAL_EPOCH = args.local_epochs
@@ -1435,16 +1442,18 @@ def main():
     torch.manual_seed(SEED); random.seed(SEED); np.random.seed(SEED)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M")
-    sitl_cache = config.CACHE_DIR / f"{args.sitl_folder}_features.npz"
+    sitl_cache = args.cache_dir / f"{args.sitl_folder}_features.npz"
     if not sitl_cache.exists():
         raise FileNotFoundError(
             f"Feature cache not found: {sitl_cache}\n"
-            "Run `python3 tools/preprocessing/build_features.py` first."
+            "Run `fireclassify feature-build` first."
         )
     with np.load(sitl_cache) as cached:
         if "X_seq" not in cached:
             raise KeyError(f"{sitl_cache} does not contain X_seq")
         N_FEAT = int(cached["X_seq"].shape[2])
+        if "feature_names" in cached:
+            config.TARGET_FEATURES = [str(name) for name in cached["feature_names"]]
         cached_labels = cached["y"].copy()
         cached_runs = cached["runs"].copy() if "runs" in cached else None
 
@@ -1624,8 +1633,8 @@ def main():
 
     # ── real flight evaluation from the same project caches ──────────────────
     real_cache_paths = [
-        config.CACHE_DIR / f"{folder}_features.npz"
-        for folder in config.REAL_FLIGHT_FOLDERS
+        args.cache_dir / f"{folder}_features.npz"
+        for folder in args.real_folders
     ]
     real_cache_paths = [path for path in real_cache_paths if path.exists()]
     print(

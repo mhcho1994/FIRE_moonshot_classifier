@@ -232,4 +232,4 @@ RUN python -m pip install \
 
 USER ${USERNAME} 
 
-ENTRYPOINT ["fire-classifier"]
+ENTRYPOINT ["fireclassify"]

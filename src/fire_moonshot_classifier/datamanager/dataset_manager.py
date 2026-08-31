@@ -9,12 +9,53 @@ import numpy as np
 from fire_moonshot_classifier.datamanager.data_extractor import parse_ardu_bin, parse_px4_ulog, parse_real_csv
 
 
-def process_dataset_folder(base_folder, is_sitl=True, measurement_type='mocap', max_runs=None):
+def process_raw_trajectory(raw_data, class_label, run_name, target_features=None):
+    """Convert one parsed trajectory into classified turn-feature sequences."""
+    X_ts, T_ts, y, runs = [], [], [], []
+    if raw_data is None:
+        return X_ts, T_ts, np.asarray(y), runs
+
+    selected_features = target_features or config.TARGET_FEATURES
+    target_indices = [config.FEATURE_MAP[name] for name in selected_features]
+
+    kinematic_features = kinematic_processor.compute_kinematics_pca(raw_data)
+    if kinematic_features is None:
+        return X_ts, T_ts, np.asarray(y), runs
+    _, spans = flight_segmenter.extract_segments(kinematic_features)
+
+    t_full, feat_full = kinematic_processor.compute_kinematics_diff(raw_data)
+    if t_full is None or feat_full is None:
+        return X_ts, T_ts, np.asarray(y), runs
+
+    turn_spans = spans.get('turn_left', []) + spans.get('turn_right', [])
+    for span in turn_spans:
+        indices = np.where((t_full >= span[0]) & (t_full <= span[1]))[0]
+        if len(indices) == 0:
+            continue
+
+        X_ts.append(feat_full[indices][:, target_indices])
+        T_ts.append(t_full[indices] - t_full[indices][0])
+        y.append(class_label)
+        runs.append(str(run_name))
+
+    return X_ts, T_ts, np.asarray(y), runs
+
+
+def process_dataset_folder(
+    base_folder,
+    is_sitl=True,
+    measurement_type='mocap',
+    max_runs=None,
+    target_features=None,
+    data_root=Path("data"),
+):
     """
     Crawls folders, runs the ETL pipeline (Extract -> Kinematics -> Segment), 
     and returns extracted Turn segments.
     """
-    base_dir = Path("data") / base_folder
+    supplied_path = Path(base_folder).expanduser()
+    base_dir = supplied_path if supplied_path.exists() else Path(data_root) / supplied_path
+    dataset_name = base_dir.name
     X_ts, T_ts, y, runs = [], [], [], []
     
     if not base_dir.exists():
@@ -27,10 +68,6 @@ def process_dataset_folder(base_folder, is_sitl=True, measurement_type='mocap', 
         print(f"[Info] Limiting processing to {max_runs} runs for {base_folder} (out of {len(run_folders)}).")
         run_folders = run_folders[:max_runs]
     
-    # AI Classification Target Features
-    target_features = config.TARGET_FEATURES
-    target_indices = [config.FEATURE_MAP[f] for f in target_features]
-
     for run_folder in run_folders:
         run_dir = base_dir / run_folder
         
@@ -53,33 +90,18 @@ def process_dataset_folder(base_folder, is_sitl=True, measurement_type='mocap', 
                     
                     if raw_data is None: continue
                     
-                    # [Step 2 & 3: Transform (Kinematics -> Segment)]
-                    # Use new kinematic processor for HMM-based segmentation
-                    kinematic_features = kinematic_processor.compute_kinematics_pca(raw_data)
-                    if kinematic_features is None: continue
-                    segs, spans = flight_segmenter.extract_segments(kinematic_features)
-                    
-                    # Use diff-based kinematic processor for AI features extraction
-                    t_full, feat_full = kinematic_processor.compute_kinematics_diff(raw_data)
-                    if t_full is None or feat_full is None: continue
-
-                    # [Step 4: Load Turn Features]
-                    count_in_run = 0
-                    turn_spans = spans.get('turn_left', []) + spans.get('turn_right', [])
-                    
-                    if len(turn_spans) > 0:
-                        for span in turn_spans:
-                            # Extract corresponding indices using time spans from the new segmenter
-                            indices = np.where((t_full >= span[0]) & (t_full <= span[1]))[0]
-                            if len(indices) == 0: continue
-                            
-                            feat_turn = feat_full[indices][:, target_indices]
-                            time_turn = t_full[indices] - t_full[indices][0]
-                            X_ts.append(feat_turn)
-                            T_ts.append(time_turn)
-                            y.append(fw_config.class_label)
-                            runs.append(f"{base_folder}/{run_folder}")
-                            count_in_run += 1
+                    # [Step 2-4: Kinematics -> Segment -> selected turn features]
+                    X_run, T_run, y_run, runs_run = process_raw_trajectory(
+                        raw_data,
+                        fw_config.class_label,
+                        f"{dataset_name}/{run_folder}",
+                        target_features=target_features,
+                    )
+                    X_ts.extend(X_run)
+                    T_ts.extend(T_run)
+                    y.extend(y_run.tolist())
+                    runs.extend(runs_run)
+                    count_in_run = len(X_run)
                             
                     if count_in_run > 0:
                         print(f"    - {run_folder} [{fw_config.name.upper()}]: {count_in_run} turn segments extracted.")

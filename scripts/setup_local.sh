@@ -86,6 +86,9 @@ python -m pip install \
   tqdm \
   tsfresh
 
+# Install the project itself and resolve any dependencies declared in pyproject.toml.
+python -m pip install --editable .
+
 ACTIVATE_HOOK="${VENV_DIR}/bin/activate"
 PYTHONPATH_LINE="export PYTHONPATH=\"${REPO_ROOT}:${REPO_ROOT}/drone_classifier:${REPO_ROOT}/drone_classifier_svm:${REPO_ROOT}/trajectory_processing:${REPO_ROOT}/drone_classifier_modules/src:\${PYTHONPATH:-}\""
 

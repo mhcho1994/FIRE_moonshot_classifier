@@ -12,7 +12,7 @@ CACHE_DIR = BASE_DIR / "cache"
 # 2. Dataset Settings
 # ==========================================
 SITL_FOLDER = "260615_sitl_logs"
-REAL_FLIGHT_FOLDERS = ["260527_flight_logs_1", "260527_flight_logs_2"]
+REAL_FLIGHT_FOLDERS = ["260325_flight_logs", "260417_flight_logs", "260527_flight_logs_1", "260527_flight_logs_2"]
 
 from dataclasses import dataclass
 from typing import List, Optional

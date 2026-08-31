@@ -10,6 +10,7 @@ tests/**
 !models/.gitkeep
 !configs/.gitkeep
 !tests/.gitkeep
+!tests/**/*.py
 
 # Python cache files
 __pycache__/
@@ -19,4 +20,3 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
-
