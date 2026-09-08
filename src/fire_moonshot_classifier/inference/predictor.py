@@ -1,4 +1,4 @@
-"""Unlabeled trajectory CSV to a JSON-serializable autopilot prediction."""
+"""Unlabeled trajectory CSV or NPZ to a JSON-serializable autopilot prediction."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -17,7 +17,30 @@ def read_trajectory(csv_path, measurement_type="vision"):
     if measurement_type not in ("vision", "mocap"):
         raise ValueError("measurement_type must be vision or mocap")
     csv_path = Path(csv_path).expanduser()
-    data = np.atleast_1d(np.genfromtxt(csv_path, delimiter=",", names=True, encoding="utf-8-sig"))
+    if csv_path.suffix.lower() == ".npz":
+        with np.load(csv_path, allow_pickle=False) as npz:
+            t = np.asarray(npz["times_s"], dtype=float)
+            key = "trajectory_smooth" if measurement_type == "vision" else "gt_drone"
+            positions = np.asarray(npz[key], dtype=float)
+
+        if t.ndim != 1 or positions.shape != (len(t), 3):
+            raise ValueError("NPZ requires times_s: (N,) and positions: (N, 3)")
+
+        columns = (
+            ("x_smooth", "y_smooth", "z_smooth")
+            if measurement_type == "vision"
+            else ("gt_x", "gt_y", "gt_z")
+        )
+        data = np.rec.fromarrays(
+            [t, *positions.T],
+            names=["time_s", *columns],
+        )
+    else:
+        data = np.atleast_1d(
+            np.genfromtxt(
+                csv_path, delimiter=",", names=True, encoding="utf-8-sig"
+            )
+        )
     names = data.dtype.names or ()
     time_key = next((key for key in ("time_s", "timestamp") if key in names), None)
     candidates = (("x_smooth", "y_smooth", "z_smooth"), ("xsmooth", "ysmooth", "zsmooth"))
@@ -42,7 +65,7 @@ def read_trajectory(csv_path, measurement_type="vision"):
 
 
 class TrajectoryPredictor:
-    """Load once per server worker, then call predict_trajectory for each CSV.
+    """Load once per server worker, then call predict_trajectory for each CSV or NPZ.
 
     Inference uses frozen BatchNorm statistics and never modifies model state.
     CPU is the default so classification does not compete with SAM3 for GPU memory.
