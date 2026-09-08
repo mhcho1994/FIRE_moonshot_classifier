@@ -50,15 +50,15 @@ def _calculate_emission_probs(features, hover_thresh=0.5, pitch_ascending=45.0,
 
     return prob_matrix
 
-def _smooth_with_viterbi(emission_probs):
+def _smooth_with_viterbi(emission_probs, hmm_pi=None, hmm_a=None):
     """
     Decodes the most likely sequence of primitives using Viterbi algorithm.
     """
     n_frames, n_states = emission_probs.shape
-    pi = config.HMM_PI # Initial probs
+    pi = config.HMM_PI if hmm_pi is None else np.asarray(hmm_pi)
     
     # Transition Matrix A (Physical Rules Engine)
-    A = config.HMM_A
+    A = config.HMM_A if hmm_a is None else np.asarray(hmm_a)
     
     eps = 1e-10
     log_pi, log_A, log_B = np.log(pi + eps), np.log(A + eps), np.log(emission_probs + eps)
@@ -95,7 +95,8 @@ def get_segmentation_details(features):
 # ==============================================================================
 
 def extract_segments(features_dict, dt=None, min_turn_duration=None, 
-                     yaw_rate_threshold=None, straight_duration=None, heading_margin=None):
+                     yaw_rate_threshold=None, straight_duration=None, heading_margin=None,
+                     *, hmm_pi=None, hmm_a=None):
     """
     Analyzes geometric features (from kinematic_processor.py) to split the flight.
     Returns the exact same `segments` and `spans` dictionary structure as the legacy code.
@@ -115,7 +116,7 @@ def extract_segments(features_dict, dt=None, min_turn_duration=None,
 
     # 1. Run the Probabilistic & HMM pipeline
     emission_probs = _calculate_emission_probs(features_dict)
-    smoothed_labels = _smooth_with_viterbi(emission_probs)
+    smoothed_labels = _smooth_with_viterbi(emission_probs, hmm_pi, hmm_a)
 
     # 2. Parse the contiguous blocks of labels and populate the legacy dictionary
     # We find the start and end indices of identical consecutive labels.

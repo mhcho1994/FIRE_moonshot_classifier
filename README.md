@@ -298,10 +298,79 @@ fireclassify train diversify \
   --no-wandb
 ```
 
-The label in `LABEL=CSV` is ground truth used by the current supervised
+The label in `LABEL=CSV` is ground truth used by the supervised
 evaluation workflow; accepted labels are `px4`, `ardupilot` (or `ardu`), and
-`cogni`. An unlabeled standalone prediction artifact is outside the current
-three-command workflow and is not implied by this adapter.
+`cogni`. For an unlabeled trajectory, use the separate `predict` command below;
+do not invent a label or run training on the web server.
+
+### Unlabeled Prediction and Model Export
+
+Export an existing **cached turn-feature** DIVERSIFY checkpoint once on the
+training machine. This calibrates its OOD reference bank on the training split
+and threshold on the validation split, using the original split seed:
+
+```bash
+fireclassify export \
+  --checkpoint models/cnn_diversify_20260831_1429.pt \
+  --sitl-cache src/fire_moonshot_classifier/cache/260615_sitl_logs_features.npz \
+  --seed 42 \
+  --output models/cnn_diversify_20260831_1429.inference.pt
+```
+
+The output contains inference weights, the L1 kNN bank, OOD threshold,
+preprocessing recipe, feature/class order, voting settings, and calibration
+provenance. A companion `.pt.sha256` file records its checksum. Older caches
+without `feature_names` require `--target-features XY-Accel XY-Jerk Curvature`
+in their actual training channel order. Legacy `diversify_feat7_*` raw-log
+checkpoints are not supported by this turn-feature exporter.
+
+New `fireclassify train diversify` runs also save a `*.inference.pt` bundle
+automatically, preserving the calibration from that training run. Prefer this
+artifact when available: reconstructing calibration from an older checkpoint
+requires the matching cache, preprocessing code, and original split seed.
+
+Only the bundle and a new trajectory CSV are needed on the inference server:
+
+```bash
+fireclassify predict \
+  --trajectory /work/triangulation/run_001/trajectory.csv \
+  --model models/cnn_diversify_20260831_1429.inference.pt \
+  --output /work/classification/run_001/prediction.json
+```
+
+The command prints JSON to stdout and optionally writes the same JSON to
+`--output`. `--sha256 DIGEST` verifies the bundle before loading.
+CPU is the default; `--device cuda` and `--batch-size` are available.
+Raw training weights are rejected with an instruction to export them first.
+
+```python
+from fire_moonshot_classifier.inference import predict_trajectory
+
+result = predict_trajectory(
+    "/work/triangulation/run_001/trajectory.csv",
+    "models/cnn_diversify_20260831_1429.inference.pt",
+)
+print(result["prediction"])  # PX4, ArduPilot, or Unknown
+```
+
+For a web server, create `TrajectoryPredictor(model_path)` once per worker and
+reuse `predictor.predict_trajectory(csv_path)`. Inference does not read SITL
+logs, feature caches, labels, or initialize W&B. It retains HMM turn segmentation,
+kinematic features, per-window z-score, the L1 OOD gate, and majority voting.
+
+Inputs use seconds and meters with vertical Z. Vision mode (default) reads
+`time_s`/`timestamp` and `x_smooth,y_smooth,z_smooth` or `xsmooth,ysmooth,zsmooth`.
+`--measurement-type mocap` explicitly selects `gt_x,gt_y,gt_z` or `gtx,gty,gtz`.
+Non-finite rows are removed; timestamps are sorted and duplicate timestamps keep
+the first valid sample before velocity calculation. No filename or ground-truth
+column is used as a class label.
+
+Insufficient samples, no usable turn windows, or insufficient in-distribution
+windows return `Unknown` with a `reason`. Missing files and malformed schemas
+raise errors. `vote_fraction` is the winning fraction of accepted window votes,
+**not a calibrated class probability**; ties retain the evaluator's ArduPilot
+tie break. See [deployment details](docs/inference_deployment.md) for web integration,
+model hosting, and input-quality considerations.
 
 The legacy commands continue to work:
 

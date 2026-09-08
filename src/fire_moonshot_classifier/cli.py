@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -27,7 +28,7 @@ def _add_cache_dir(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="fireclassify",
-        description="Build trajectory features and train the FIRE autopilot classifiers.",
+        description="Build features, train, export, and predict trajectory autopilot classes.",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {_package_version()}")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -116,7 +117,63 @@ def build_parser() -> argparse.ArgumentParser:
     _add_cache_dir(diversify)
     diversify.set_defaults(handler=_run_diversify)
 
+    export = commands.add_parser("export", help="Bundle a frozen Diversify checkpoint with OOD calibration.")
+    export.add_argument("--checkpoint", type=Path, required=True)
+    export.add_argument("--sitl-cache", type=Path, required=True,
+                        help="Training turn-feature cache; used once for calibration.")
+    export.add_argument("--output", type=Path, required=True)
+    export.add_argument("--target-features", nargs="+", default=None,
+                        help="Training channel order, required for caches without feature_names.")
+    export.add_argument("--seed", type=int, default=42, help="Original training split seed.")
+    export.add_argument("--knn-k", type=int, default=5)
+    export.add_argument("--percentile", type=float, default=95.0)
+    export.add_argument("--min-valid", type=int, default=3)
+    export.add_argument("--min-fraction", type=float, default=0.15)
+    export.add_argument("--batch-size", type=int, default=128)
+    export.set_defaults(handler=_run_export)
+
+    predict = commands.add_parser("predict", help="Classify one unlabeled trajectory CSV using an exported bundle.")
+    predict.add_argument("--trajectory", type=Path, required=True)
+    predict.add_argument("--model", type=Path, required=True, help="Exported inference bundle, not raw weights.")
+    predict.add_argument("--output", type=Path, default=None, help="Also save the result JSON here.")
+    predict.add_argument("--measurement-type", choices=("vision", "mocap"), default="vision")
+    predict.add_argument("--device", default="cpu")
+    predict.add_argument("--batch-size", type=int, default=128)
+    predict.add_argument("--sha256", default=None, help="Expected bundle digest, checked before loading.")
+    predict.set_defaults(handler=_run_predict)
+
     return parser
+
+
+def _run_export(args: argparse.Namespace) -> int:
+    from fire_moonshot_classifier.inference.export import export_checkpoint
+
+    names = ([name.strip() for value in args.target_features for name in value.split(",") if name.strip()]
+             if args.target_features else None)
+    path = export_checkpoint(
+        args.checkpoint, args.sitl_cache, args.output, feature_names=names, seed=args.seed,
+        knn_k=args.knn_k, percentile=args.percentile, min_valid=args.min_valid,
+        min_fraction=args.min_fraction, batch_size=args.batch_size,
+    )
+    print(path)
+    return 0
+
+
+def _run_predict(args: argparse.Namespace) -> int:
+    from fire_moonshot_classifier.inference import predict_trajectory
+
+    if args.output and args.output.resolve() in (args.trajectory.resolve(), args.model.resolve()):
+        raise ValueError("JSON output must differ from trajectory and model input paths")
+    result = predict_trajectory(
+        args.trajectory, args.model, measurement_type=args.measurement_type,
+        device=args.device, batch_size=args.batch_size, expected_sha256=args.sha256,
+    )
+    serialized = json.dumps(result, indent=2, allow_nan=False)
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(serialized + "\n", encoding="utf-8")
+    print(serialized)
+    return 0
 
 
 def _run_feature_build(args: argparse.Namespace) -> int:

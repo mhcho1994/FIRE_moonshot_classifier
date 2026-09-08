@@ -146,76 +146,16 @@ class ReverseLayerF(Function):
     def backward(ctx, grad_output):
         return grad_output.neg() * ctx.alpha, None
 
-class TemporalAttentionPooling(nn.Module):
-    """
-    Learnable attention pooling over the temporal dimension.
-    Input: (B, C, T) → Output: (B, C)
-    """
-    def __init__(self, in_channels, hidden_dim= ATTN_HIDDEN):
-        super().__init__()
-        self.attention = nn.Sequential(
-            nn.Linear(in_channels, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, 1)
-        )
+from fire_moonshot_classifier.networks import (
+    FlightFeaturizer as _FlightFeaturizer,
+    FeatBottleneck, PrototypeClassifier, TemporalAttentionPooling,
+)
 
-    def forward(self, x):
-        x = x.permute(0, 2, 1)  # (B, T, C)
-        attn_weights = self.attention(x)  # (B, T, 1)
-        attn_weights = F.softmax(attn_weights, dim=1)  # (B, T, 1)
 
-        out = (x * attn_weights).sum(dim=1)  # (B, C)
-        
-        return out, attn_weights
-    
-class FlightFeaturizer(nn.Module):
-    """
-    1D-CNN on fixed (B, N_FEAT, WIN_LEN) input.
-      Conv1(N_FEAT→32, k=7) + MaxPool(2) → (B, 32, 50)
-      Conv2(32→64, k=5) + MaxPool(2) → (B, 64, 25)
-      Conv3(64→128,k=3)              → (B, 128, 25)
-      AdaptiveAvgPool1d(1)           → (B, 128)
-    """
+class FlightFeaturizer(_FlightFeaturizer):
+    """Retain the training script's configurable constructor."""
     def __init__(self):
-        super().__init__()
-        self.block1 = nn.Sequential(
-            nn.Conv1d(N_FEAT, 32, kernel_size=7, padding=3, bias=False),
-            nn.BatchNorm1d(32), nn.ReLU(),
-            nn.MaxPool1d(2),
-        )
-        self.block2 = nn.Sequential(
-            nn.Conv1d(32, 64, kernel_size=5, padding=2, bias=False),
-            nn.BatchNorm1d(64), nn.ReLU(),
-            nn.MaxPool1d(2),
-        )
-        self.block3 = nn.Sequential(
-            nn.Conv1d(64, CNN_CH, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm1d(CNN_CH), nn.ReLU(),
-        )
-        self.attn_pool = TemporalAttentionPooling(CNN_CH)
-        self.in_features = CNN_CH
-
-    def forward(self, x):
-        x = self.block3(self.block2(self.block1(x)))  # (B, CNN_CH, L')
-        h, _ = self.attn_pool(x)                      # Attention Applied Pooling to get (B, CNN_CH)
-        return h                                      # (B, CNN_CH)
-
-    def forward_features(self, x):
-        f1 = self.block1(x)
-        f2 = self.block2(f1)
-        f3 = self.block3(f2)
-        h, attn_weights = self.attn_pool(f3)          
-        return f1, f2, h
-
-
-class FeatBottleneck(nn.Module):
-    def __init__(self, in_dim, out_dim=BOTTLENECK_DIM):
-        super().__init__()
-        self.fc = nn.Linear(in_dim, out_dim)
-        self.bn = nn.BatchNorm1d(out_dim)
-
-    def forward(self, x):
-        return self.bn(self.fc(x))
+        super().__init__(N_FEAT, CNN_CH, ATTN_HIDDEN)
 
 
 class FeatClassifier(nn.Module):
@@ -227,18 +167,6 @@ class FeatClassifier(nn.Module):
         return self.fc(x)
 
 
-class PrototypeClassifier(nn.Module):
-    """
-    Distance-based classifier: logit = -dist(x, prototype_k).
-    Low max-logit (= large min-distance) → OOD signal.
-    """
-    def __init__(self, n_classes, in_dim=BOTTLENECK_DIM):
-        super().__init__()
-        self.prototypes = nn.Parameter(torch.randn(n_classes, in_dim))
-
-    def forward(self, x):
-        dist = torch.cdist(x, self.prototypes)  # (B, n_classes)
-        return -dist
 
 
 class Discriminator(nn.Module):
@@ -550,19 +478,9 @@ def _sequence_length(sequence):
 
 
 def _windows_from_sequence(sequence):
-    """Convert one cached (L, F) turn segment to fixed CNN windows."""
-    length = _sequence_length(sequence)
-    if length < MIN_WIN:
-        return []
+    from fire_moonshot_classifier.processor.sequence_windows import windows_from_sequence
 
-    sequence = np.asarray(sequence[:length], dtype=np.float32)
-    if length < WIN_LEN:
-        sequence = np.pad(
-            sequence,
-            ((0, WIN_LEN - length), (0, 0)),
-            mode="edge",
-        )
-    return _slide_windows(sequence)
+    return windows_from_sequence(sequence, WIN_LEN, HOP_LEN, MIN_WIN)
 
 
 def load_cached_windows(cache_path, segment_indices=None):
@@ -611,42 +529,7 @@ def load_cached_windows(cache_path, segment_indices=None):
     )
 
 
-def split_cached_segments(labels, groups=None, test_ratio=TEST_RATIO, val_ratio=0.15):
-    """Split at run level when cache groups exist, otherwise by segment."""
-    labels = np.asarray(labels)
-    if groups is not None:
-        groups = np.asarray(groups)
-        unique_groups = np.unique(groups)
-        np.random.shuffle(unique_groups)
-        n_test = max(1, int(len(unique_groups) * test_ratio))
-        remaining = unique_groups[n_test:]
-        n_val = max(1, int(len(remaining) * val_ratio))
-        test_groups = unique_groups[:n_test]
-        val_groups = remaining[:n_val]
-        train_groups = remaining[n_val:]
-        return (
-            np.flatnonzero(np.isin(groups, train_groups)),
-            np.flatnonzero(np.isin(groups, val_groups)),
-            np.flatnonzero(np.isin(groups, test_groups)),
-        )
-
-    train_idx, val_idx, test_idx = [], [], []
-
-    for cls in (0, 1):
-        cls_idx = np.flatnonzero(labels == cls)
-        np.random.shuffle(cls_idx)
-        n_test = max(1, int(len(cls_idx) * test_ratio)) if len(cls_idx) > 2 else 0
-        remaining = cls_idx[n_test:]
-        n_val = max(1, int(len(remaining) * val_ratio)) if len(remaining) > 2 else 0
-        test_idx.extend(cls_idx[:n_test])
-        val_idx.extend(remaining[:n_val])
-        train_idx.extend(remaining[n_val:])
-
-    return (
-        np.asarray(train_idx, dtype=np.int64),
-        np.asarray(val_idx, dtype=np.int64),
-        np.asarray(test_idx, dtype=np.int64),
-    )
+from fire_moonshot_classifier.datamanager.splits import split_cached_segments
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1626,6 +1509,21 @@ def main(argv=None):
     print(f"\n{'='*70}\n  kNN OOD Calibration  (k={KNN_K})")
     bank_feats, _ = build_knn_bank(model, train_ns_ld)
     threshold     = calibrate_threshold(model, val_ld, bank_feats)
+    # Preserve this exact training-run calibration for data-free deployment.
+    from fire_moonshot_classifier.inference.bundle import save_bundle, sha256_file
+
+    inference_path = model_path.with_suffix(".inference.pt")
+    save_bundle(
+        inference_path, state_dict=model.state_dict(), feature_names=config.TARGET_FEATURES,
+        bank_l1=bank_feats[0], threshold=threshold, knn_k=KNN_K,
+        min_valid=MIL_MIN_VALID, min_fraction=MIL_MIN_FRAC,
+        win_len=WIN_LEN, hop_len=HOP_LEN, min_win=MIN_WIN,
+        provenance={"calibration": "training_run", "checkpoint": model_path.name,
+                    "checkpoint_sha256": sha256_file(model_path),
+                    "sitl_cache_sha256": sha256_file(sitl_cache), "seed": SEED,
+                    "ood_percentile": OOD_PCTILE, "git_sha": GIT_SHA},
+    )
+    print(f"  Inference bundle → {inference_path}")
     sitl_false_reject = compute_rejection_rate(model, test_ld, bank_feats, threshold)
     print(f"  SITL false-rejection: {sitl_false_reject*100:.1f}%")
     wandb.run.summary["ood/threshold"]         = threshold
@@ -1729,6 +1627,7 @@ def main(argv=None):
         },
     )
     artifact.add_file(str(model_path))
+    artifact.add_file(str(inference_path))
     artifact.add_file(str(out))
     run.log_artifact(artifact)
     wandb.finish()

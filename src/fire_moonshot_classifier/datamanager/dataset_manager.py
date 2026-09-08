@@ -9,23 +9,23 @@ import numpy as np
 from fire_moonshot_classifier.datamanager.data_extractor import parse_ardu_bin, parse_px4_ulog, parse_real_csv
 
 
-def process_raw_trajectory(raw_data, class_label, run_name, target_features=None):
-    """Convert one parsed trajectory into classified turn-feature sequences."""
-    X_ts, T_ts, y, runs = [], [], [], []
+def extract_turn_sequences(raw_data, target_features=None, *, hmm_pi=None, hmm_a=None):
+    """Extract unlabeled turn sequences using the version-1 cache pipeline."""
+    X_ts, T_ts = [], []
     if raw_data is None:
-        return X_ts, T_ts, np.asarray(y), runs
+        return X_ts, T_ts
 
     selected_features = target_features or config.TARGET_FEATURES
     target_indices = [config.FEATURE_MAP[name] for name in selected_features]
 
     kinematic_features = kinematic_processor.compute_kinematics_pca(raw_data)
     if kinematic_features is None:
-        return X_ts, T_ts, np.asarray(y), runs
-    _, spans = flight_segmenter.extract_segments(kinematic_features)
+        return X_ts, T_ts
+    _, spans = flight_segmenter.extract_segments(kinematic_features, hmm_pi=hmm_pi, hmm_a=hmm_a)
 
     t_full, feat_full = kinematic_processor.compute_kinematics_diff(raw_data)
     if t_full is None or feat_full is None:
-        return X_ts, T_ts, np.asarray(y), runs
+        return X_ts, T_ts
 
     turn_spans = spans.get('turn_left', []) + spans.get('turn_right', [])
     for span in turn_spans:
@@ -35,8 +35,15 @@ def process_raw_trajectory(raw_data, class_label, run_name, target_features=None
 
         X_ts.append(feat_full[indices][:, target_indices])
         T_ts.append(t_full[indices] - t_full[indices][0])
-        y.append(class_label)
-        runs.append(str(run_name))
+
+    return X_ts, T_ts
+
+
+def process_raw_trajectory(raw_data, class_label, run_name, target_features=None):
+    """Attach evaluation labels to the shared unlabeled feature pipeline."""
+    X_ts, T_ts = extract_turn_sequences(raw_data, target_features)
+    y = np.full(len(X_ts), class_label)
+    runs = [str(run_name)] * len(X_ts)
 
     return X_ts, T_ts, np.asarray(y), runs
 

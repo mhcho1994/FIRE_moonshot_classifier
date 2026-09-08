@@ -1,6 +1,4 @@
 import numpy as np
-from pymavlink import mavutil
-from pyulog import ULog
 
 
 def parse_px4_ulog(ulog_path):
@@ -8,6 +6,8 @@ def parse_px4_ulog(ulog_path):
     Parses a PX4 ULog file and extracts raw local position and velocity data.
     """
     try:
+        from pyulog import ULog
+
         ulog = ULog(ulog_path)
         loc_data = ulog.get_dataset('vehicle_local_position').data
         t_loc = loc_data['timestamp'] / 1e6
@@ -29,6 +29,8 @@ def parse_ardu_bin(bin_path):
     Parses an ArduPilot DataFlash log (.bin) and extracts raw position and velocity data.
     """
     try:
+        from pymavlink import mavutil
+
         mlog = mavutil.mavlink_connection(bin_path)
         t_loc, x, y, z, vx, vy, vz = [], [], [], [], [], [], []
         
