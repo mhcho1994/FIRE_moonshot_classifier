@@ -5,8 +5,10 @@ models/**
 configs/**
 tests/**
 
+# Keep data clone/download script
+!data/sync_data.py
+
 # Keep placeholder files
-!data/.gitkeep
 !models/.gitkeep
 !configs/.gitkeep
 !tests/.gitkeep

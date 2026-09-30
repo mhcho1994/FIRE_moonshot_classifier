@@ -123,9 +123,153 @@ Skip PyTorch installation when it is already installed:
 ./scripts/setup_local.sh --skip-torch
 ```
 
-> `setup_local.sh` installs the main scientific-computing dependencies. Running
-> `pip install -e .` afterward is recommended to install the project itself and
-> synchronize all dependencies declared in `pyproject.toml`, including W&B.
+> `setup_local.sh` installs rclone when missing, the scientific-computing
+> dependencies, and the project in editable mode. Installing rclone system-wide
+> may prompt for sudo; existing rclone installations are reused.
+
+## Flight Test and SITL Data Retrieval
+
+`data/sync_data.py` uses **rclone** for OneDrive downloads and uploads. Run the
+commands below from the repository root. Both `scripts/setup_local.sh` and the
+images built by `scripts/setup_docker.sh` install rclone when missing, using the
+[official installer](https://rclone.org/install/). Setup does not sign in or
+transfer data automatically.
+
+For an existing local environment, install just rclone without rebuilding the
+Python environment:
+
+```bash
+bash scripts/install_rclone.sh
+rclone version
+```
+
+### Configure OneDrive once
+
+Run configuration as your normal user, without sudo:
+
+```bash
+rclone config
+```
+
+Choose `n` (new remote), name it `motif_onedrive`, select **Microsoft OneDrive**,
+and leave `client_id` and `client_secret` blank for the defaults. Complete the
+browser sign-in and select the intended drive. See the
+[OneDrive setup guide](https://rclone.org/onedrive/).
+
+Check the connection and locate your dataset folders:
+
+```bash
+rclone lsd motif_onedrive:
+rclone config file
+```
+
+The remote paths below are examples, not verified dataset locations. Replace
+`MOTIF/FlightTest` and the SITL placeholder with paths on your configured drive.
+OneDrive browser/share URLs are not rclone remote paths. The colon after the
+remote name is required: `REMOTE:path/to/folder`. For example,
+`FIRE_moonshot_classifier:DARPA_FIRE/FIRE_Moonshot/FlightTest` uses the remote
+`FIRE_moonshot_classifier`. Writing `FIRE_moonshot_classifier/DARPA_FIRE/...`
+would be a local path; the sync script rejects it before transferring files.
+
+### Retrieve flight-test data
+
+Preview the download, then repeat with `--execute` to transfer files:
+
+```bash
+python data/sync_data.py download \
+  --onedrive-dir motif_onedrive:MOTIF/FlightTest \
+  --wsl-dir data/flight_test
+
+python data/sync_data.py download \
+  --onedrive-dir motif_onedrive:MOTIF/FlightTest \
+  --wsl-dir data/flight_test \
+  --execute
+```
+
+After downloading a flight-log source dataset, organize its trajectories:
+
+```bash
+python tools/log_processing/flight_log_processor.py \
+  --flight-logs-dir data/flight_test/260527_flight_logs
+```
+
+This creates `run_XXX/{ardu,px4,cogni}_logs/trajectory.npz` and `.csv` next to
+`source`. See [flight-log processing](tools/log_processing/README.md) for source
+precedence and raw-format requirements.
+
+### Retrieve SITL data
+
+The same sync script accepts any local destination through `--wsl-dir`. For an
+unpacked SITL dataset, point the remote at the directory containing `run_XXX`
+folders, and the local destination at that dataset's root:
+
+```bash
+# Replace this placeholder with the actual remote dataset directory.
+SITL_REMOTE='motif_onedrive:REPLACE_WITH_SITL_DATASET_FOLDER'
+
+python data/sync_data.py download \
+  --onedrive-dir "$SITL_REMOTE" \
+  --wsl-dir data/260615_sitl_logs
+
+python data/sync_data.py download \
+  --onedrive-dir "$SITL_REMOTE" \
+  --wsl-dir data/260615_sitl_logs \
+  --execute
+```
+
+The expected result is `data/260615_sitl_logs/run_XXX/...`. The sync script
+copies the remote directory's contents and does not extract archives. If the
+shared data is a `.tar.gz` archive, download it, inspect its layout with
+`tar -tzf PATH_TO_ARCHIVE`, and extract it into the appropriate local directory.
+
+### Upload processed or updated data
+
+Use `upload` with the same paths to transfer in the opposite direction. Omit
+`--execute` first to preview:
+
+```bash
+python data/sync_data.py upload \
+  --wsl-dir data/flight_test \
+  --onedrive-dir motif_onedrive:MOTIF/FlightTest \
+  --execute
+```
+
+All transfers default to dry-run and include every file. `--default-excludes`
+opts into the script's predefined exclusions, which currently omit videos and
+`SAM3_pipeline`; leave it off to retrieve those inputs. Repeat `--exclude
+PATTERN` for custom exclusions. Without `--delete`, files present only at the
+destination are retained.
+
+### Retrieve data inside Docker
+
+Rebuild existing images to include rclone. To reuse a OneDrive connection
+configured on the host, pass the directory reported by `rclone config file`:
+
+```bash
+./scripts/setup_docker.sh dev-build
+RCLONE_CONFIG_DIR="$HOME/.config/rclone" ./scripts/setup_docker.sh dev-run
+./scripts/setup_docker.sh dev-shell
+
+# Inside the container:
+rclone listremotes
+# Run the same sync_data.py commands shown above.
+```
+
+The mount is optional and writable so rclone can refresh its authentication
+tokens. Credentials stay in the host configuration directory, outside the
+image. Development-container downloads go into the bind-mounted repository
+and remain available on the host.
+
+Without a host configuration, run `rclone config` inside the container. For a
+container or server without a browser, answer `n` to browser authentication and
+follow the displayed `rclone authorize "onedrive"` instructions on a machine
+with a browser; see [headless setup](https://rclone.org/remote_setup/). A
+configuration created only inside the container is lost when it is recreated.
+
+`RCLONE_CONFIG_DIR` also works with `release-run`; build with `MATCH_HOST_ID=1`
+when sharing a host config that is readable only by its owner. Release
+containers do not bind-mount the repository, so their downloaded data must be
+copied out before recreating the container.
 
 ## Data Layout
 
@@ -502,6 +646,7 @@ has been installed.
 | `MATCH_HOST_ID` | `0` | Use the host IDs for the release image when set to `1` |
 | `RELEASE_UID`, `RELEASE_GID` | `1000` | User IDs for the release image |
 | `NO_CACHE` | `0` | Disable the Docker build cache when set to `1` |
+| `RCLONE_CONFIG_DIR` | Unset | Optional host rclone configuration directory mounted into dev/release containers |
 
 To expose a specific GPU:
 

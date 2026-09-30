@@ -62,6 +62,10 @@ else
     SELECTED_TORCH_INDEX_URL="https://download.pytorch.org/whl/cpu"
 fi
 
+# Optional host configuration mount; writable so OAuth tokens can refresh.
+RCLONE_CONFIG_DIR="${RCLONE_CONFIG_DIR:-}"
+RCLONE_MOUNT_ARGS=()
+
 GPU_ARGS=()
 
 if [[ "${USE_GPU}" == "1" ]]; then
@@ -93,7 +97,7 @@ Usage:
 
 Commands:
   dev-build
-      Build the development image.
+      Build the development image, including rclone for OneDrive transfers.
 
   dev-run
       Recreate the development container from the development image,
@@ -112,7 +116,7 @@ Commands:
       Remove the development container and development image.
 
   release-build
-      Build the release image using a normal, non-editable installation.
+      Build the release image with rclone and a normal, non-editable installation.
 
   release-run
       Recreate a persistent release container from the release image.
@@ -152,9 +156,29 @@ Environment variables:
   TORCH_INDEX_URL=<url>
       Override the PyTorch package index.
 
+  RCLONE_CONFIG_DIR=<directory>
+      Mount an existing host rclone configuration directory into the container.
+      Optional; locate the configuration file with 'rclone config file'.
+
   NO_CACHE=1
       Disable Docker build cache.
 EOF
+}
+
+
+prepare_rclone_mount() {
+    RCLONE_MOUNT_ARGS=()
+    if [[ -n "${RCLONE_CONFIG_DIR}" ]]; then
+        if [[ ! -d "${RCLONE_CONFIG_DIR}" ]]; then
+            echo "Error: RCLONE_CONFIG_DIR is not a directory: ${RCLONE_CONFIG_DIR}" >&2
+            return 1
+        fi
+        local config_directory
+        config_directory="$(cd -- "${RCLONE_CONFIG_DIR}" && pwd)" || return 1
+        RCLONE_MOUNT_ARGS=(
+            --mount "type=bind,source=${config_directory},target=/home/moonshot/.config/rclone"
+        )
+    fi
 }
 
 
@@ -275,6 +299,7 @@ start_dev_container() {
         return 1
     fi
 
+    prepare_rclone_mount || return 1
     remove_container "${DEV_CONTAINER}"
 
     echo "Starting development container"
@@ -285,6 +310,7 @@ start_dev_container() {
         --hostname "moonshot-dev" \
         --init \
         "${GPU_ARGS[@]}" \
+        "${RCLONE_MOUNT_ARGS[@]}" \
         --mount type=bind,source="${PROJECT_ROOT}",target="${CONTAINER_PROJECT_DIR}" \
         --workdir "${CONTAINER_PROJECT_DIR}" \
         "${DEV_IMAGE}" \
@@ -385,6 +411,7 @@ ensure_release_image() {
 start_release_container() {
     ensure_release_image
 
+    prepare_rclone_mount || return 1
     remove_container "${RELEASE_CONTAINER}"
 
     echo "Starting release container"
@@ -395,6 +422,7 @@ start_release_container() {
         --hostname "moonshot-release" \
         --init \
         "${GPU_ARGS[@]}" \
+        "${RCLONE_MOUNT_ARGS[@]}" \
         --workdir "${CONTAINER_PROJECT_DIR}" \
         --entrypoint /bin/bash \
         "${RELEASE_IMAGE}" \

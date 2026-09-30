@@ -46,6 +46,9 @@ done
 
 cd "${REPO_ROOT}"
 
+# OneDrive transfers in data/sync_data.py require the standalone rclone binary.
+bash "${SCRIPT_DIR}/install_rclone.sh"
+
 if [[ "${RECREATE}" == "1" && -d "${VENV_DIR}" ]]; then
   rm -rf "${VENV_DIR}"
 fi
@@ -104,3 +107,6 @@ echo ""
 echo "Local environment is ready."
 echo "Activate it with:"
 echo "  source ${VENV_DIR}/bin/activate"
+
+echo "Configure OneDrive once as your normal user: rclone config"
+echo "Data retrieval instructions: README.md (Flight Test and SITL Data Retrieval)"

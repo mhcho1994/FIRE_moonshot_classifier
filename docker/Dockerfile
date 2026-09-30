@@ -41,7 +41,12 @@ RUN apt-get update \
         python3-dev \
         python3-venv \
         tar \
+        unzip \
     && rm -rf /var/lib/apt/lists/*
+
+# Install rclone in both development and release images; credentials stay outside images.
+COPY scripts/install_rclone.sh /tmp/install_rclone.sh
+RUN bash /tmp/install_rclone.sh && rm /tmp/install_rclone.sh
 
 # ----------------------------------------------------------------------------- 
 # Python virtual environment 
