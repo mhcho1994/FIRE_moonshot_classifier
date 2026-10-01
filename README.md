@@ -171,6 +171,46 @@ remote name is required: `REMOTE:path/to/folder`. For example,
 `FIRE_moonshot_classifier`. Writing `FIRE_moonshot_classifier/DARPA_FIRE/...`
 would be a local path; the sync script rejects it before transferring files.
 
+### Retrieve a folder shared with you
+
+For a OneDrive folder shared by someone else, add a shortcut to **My files**
+before accessing it through your own rclone remote. This is the workaround
+documented in the [rclone shared-folder guide](https://rclone.org/onedrive/#can-not-access-shared-with-me-files).
+
+1. Sign in to OneDrive on the web with the account that received access. Open
+   **Shared > With you** (or **Shared with me**), select the folder, and choose
+   **Add shortcut to My files**.
+2. Configure the rclone remote using that same account, following the setup
+   above. If it is already configured, reuse it.
+3. Check that the shortcut and its subfolders are accessible. Replace
+   `motif_onedrive` with your remote name and `FlightTest` with the shortcut's
+   path under **My files**:
+
+```bash
+rclone lsd "motif_onedrive:"
+rclone lsd "motif_onedrive:FlightTest"
+```
+
+Pass that shortcut path to `--onedrive-dir` and preview the download:
+
+```bash
+python data/sync_data.py download \
+  --onedrive-dir "motif_onedrive:FlightTest" \
+  --wsl-dir data/flight_test \
+  --mode copy
+```
+
+Repeat with `--execute` to download the files. `copy` is the default mode and
+retains files present only in the local destination. If you move the shortcut
+under another folder in **My files**, include that folder in the remote path,
+for example `motif_onedrive:Datasets/FlightTest`.
+
+If **Add shortcut to My files** is unavailable, check the account type and
+sharing permissions. Personal OneDrive requires edit permission to add shared
+folders to **My files**. For work or school accounts, Microsoft does not support
+adding these shortcuts for external users. See Microsoft's
+[shared-folder shortcut guide](https://support.microsoft.com/en-us/onedrive/add-shortcuts-to-shared-folders-in-onedrive).
+
 ### Retrieve flight-test data
 
 Preview the download, then repeat with `--execute` to transfer files:
@@ -237,8 +277,20 @@ python data/sync_data.py upload \
 All transfers default to dry-run and include every file. `--default-excludes`
 opts into the script's predefined exclusions, which currently omit videos and
 `SAM3_pipeline`; leave it off to retrieve those inputs. Repeat `--exclude
-PATTERN` for custom exclusions. Without `--delete`, files present only at the
-destination are retained.
+PATTERN` for custom exclusions. The default `--mode copy` retains files present
+only at the destination. Use `--mode sync` to mirror the source, deleting
+destination-only files; add `--execute` to apply the changes. Both modes are
+available for `pull`, `push`, `download`, and `upload`. The former `--delete`
+option has been replaced by `--mode sync`.
+
+Preview an upload with destination-only deletions:
+
+```bash
+python data/sync_data.py upload \
+  --wsl-dir data/flight_test \
+  --onedrive-dir motif_onedrive:MOTIF/FlightTest \
+  --mode sync
+```
 
 ### Retrieve data inside Docker
 

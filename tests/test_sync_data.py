@@ -1,4 +1,4 @@
-"""CLI behavior for optional rsync and rclone exclusions without transferring files."""
+"""CLI behavior for transfer modes and exclusions without transferring files."""
 
 import contextlib
 import importlib.util
@@ -94,7 +94,7 @@ class SyncDataExcludeTests(unittest.TestCase):
                     ):
                         with self.assertRaisesRegex(ValueError, "REMOTE:path"):
                             sync_data.sync_onedrive_wsl(
-                                direction, path, destination, dry_run=False, delete=False,
+                                direction, path, destination, dry_run=False, mode="copy",
                             )
                         check.assert_not_called()
                         run.assert_not_called()
@@ -108,34 +108,62 @@ class SyncDataExcludeTests(unittest.TestCase):
             with self.subTest(path=path):
                 sync_data.validate_onedrive_path(path)
 
-    def test_execute_and_delete_preserve_backend_behavior(self):
+    def test_transfer_modes_and_execution_for_all_commands(self):
         with tempfile.TemporaryDirectory() as tmp:
-            source = Path(tmp) / "source"
-            source.mkdir()
-            for direction in ("push", "upload"):
-                args = [
-                    "sync_data.py", direction,
-                    "--windows-dir", str(source),
-                    "--wsl-dir", str(source),
-                    "--execute", "--delete",
-                ]
-                if direction == "upload":
+            windows = Path(tmp) / "windows"
+            wsl = Path(tmp) / "wsl"
+            windows.mkdir()
+            wsl.mkdir()
+            for direction in ("pull", "push", "download", "upload"):
+                for mode in (None, "copy", "sync"):
+                    for execute in (False, True):
+                        args = [
+                            "sync_data.py", direction,
+                            "--windows-dir", str(windows),
+                            "--wsl-dir", str(wsl),
+                        ]
+                        if direction in ("download", "upload"):
+                            args.extend(["--onedrive-dir", "remote:FlightTest"])
+                        if mode is not None:
+                            args.extend(["--mode", mode])
+                        if execute:
+                            args.append("--execute")
+                        with (
+                            self.subTest(direction=direction, mode=mode, execute=execute),
+                            patch.object(sys, "argv", args),
+                            patch.object(sync_data, "check_command"),
+                            patch.object(sync_data.subprocess, "run") as run,
+                            contextlib.redirect_stdout(io.StringIO()) as output,
+                        ):
+                            sync_data.main()
+                            run.assert_called_once()
+                            command = run.call_args.args[0]
+                            self.assertEqual("--dry-run" in command, not execute)
+                            self.assertIn(f"Mode           : {mode or 'copy'}", output.getvalue())
+                            if direction in ("pull", "push"):
+                                self.assertEqual(command[0], "rsync")
+                                self.assertEqual("--delete" in command, mode == "sync")
+                            else:
+                                self.assertEqual(command[:2], ["rclone", mode or "copy"])
+
+    def test_invalid_mode_and_removed_delete_option_rejected_before_transfer(self):
+        for direction in ("pull", "push", "download", "upload"):
+            for options in (["--mode", "invalid"], ["--delete"]):
+                args = ["sync_data.py", direction, *options]
+                if direction in ("download", "upload"):
                     args.extend(["--onedrive-dir", "remote:FlightTest"])
                 with (
-                    self.subTest(direction=direction),
+                    self.subTest(direction=direction, options=options),
                     patch.object(sys, "argv", args),
-                    patch.object(sync_data, "check_command"),
+                    patch.object(sync_data, "check_command") as check,
                     patch.object(sync_data.subprocess, "run") as run,
-                    contextlib.redirect_stdout(io.StringIO()),
+                    contextlib.redirect_stderr(io.StringIO()),
                 ):
-                    sync_data.main()
-                command = run.call_args.args[0]
-                self.assertNotIn("--dry-run", command)
-                if direction == "push":
-                    self.assertEqual(command[0], "rsync")
-                    self.assertIn("--delete", command)
-                else:
-                    self.assertEqual(command[:2], ["rclone", "sync"])
+                    with self.assertRaises(SystemExit) as error:
+                        sync_data.main()
+                    self.assertEqual(error.exception.code, 2)
+                    check.assert_not_called()
+                    run.assert_not_called()
 
 
 if __name__ == "__main__":

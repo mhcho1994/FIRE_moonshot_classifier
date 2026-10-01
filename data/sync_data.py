@@ -58,15 +58,19 @@ destination directory may still be created.
 
 Use ``--execute`` to perform the actual transfer.
 
-Use ``--delete`` to mirror the source to the destination. When enabled, files
-that exist only in the destination may be deleted. This option should therefore
-be used with caution.
+The default ``--mode copy`` copies new or changed files and retains files that
+exist only in the destination. Use ``--mode sync`` to mirror the source to the
+destination, deleting destination-only files. Both modes require ``--execute``
+to apply changes.
 
 Transfer backends
 -----------------
 Windows <-> WSL transfers use ``rsync``.
 
 OneDrive <-> WSL transfers use ``rclone``.
+
+``--mode copy`` uses rsync without deletion or ``rclone copy``.
+``--mode sync`` uses rsync with ``--delete`` or ``rclone sync``.
 
 Exclusion options
 -----------------
@@ -118,6 +122,12 @@ Execute WSL -> OneDrive upload::
     python3 data/sync_data.py upload \
         --onedrive-dir motif_onedrive:MOTIF/FlightTest \
         --execute
+
+Preview WSL -> OneDrive mirroring, including destination-only deletions::
+
+    python3 data/sync_data.py upload \
+        --onedrive-dir motif_onedrive:MOTIF/FlightTest \
+        --mode sync
 """
 from __future__ import annotations
 
@@ -148,9 +158,7 @@ DEFAULT_RSYNC_EXCLUDES = [
 
 # rclone patterns
 DEFAULT_RCLONE_EXCLUDES = [
-    "/260827_flight_logs_purt_test/**",
-    "**/videos/**",
-    "**/SAM3_pipeline/**",
+    "/260914_flight_logs/**",
 ]
 
 
@@ -201,7 +209,7 @@ def build_rsync_command(
     destination: Path,
     *,
     dry_run: bool,
-    delete: bool,
+    mode: str = "copy",
     excludes: list[str] | None = None,
 ) -> list[str]:
     """Build an rsync command with only the caller-selected exclusions."""
@@ -219,7 +227,7 @@ def build_rsync_command(
     if dry_run:
         cmd.append("--dry-run")
 
-    if delete:
+    if mode == "sync":
         cmd.append("--delete")
 
     for pattern in excludes or []:
@@ -242,7 +250,7 @@ def sync_windows_wsl(
     wsl_dir: Path,
     *,
     dry_run: bool,
-    delete: bool,
+    mode: str = "copy",
     excludes: list[str] | None = None,
 ) -> None:
     """Run pull or push with the supplied rsync exclusions."""
@@ -276,7 +284,7 @@ def sync_windows_wsl(
         source,
         destination,
         dry_run=dry_run,
-        delete=delete,
+        mode=mode,
         excludes=excludes,
     )
 
@@ -286,7 +294,7 @@ def sync_windows_wsl(
     print(f"Source         : {source}")
     print(f"Destination    : {destination}")
     print(f"Dry run        : {dry_run}")
-    print(f"Delete         : {delete}")
+    print(f"Mode           : {mode}")
     print("=" * 72)
 
     if excludes:
@@ -310,7 +318,7 @@ def build_rclone_command(
     destination: str,
     *,
     dry_run: bool,
-    delete: bool,
+    mode: str = "copy",
     excludes: list[str] | None = None,
 ) -> list[str]:
     """Build an rclone copy or sync command with selected exclusions."""
@@ -320,11 +328,9 @@ def build_rclone_command(
     #
     # sync:
     #   Make destination match source and delete destination-only files.
-    operation = "sync" if delete else "copy"
-
     cmd = [
         "rclone",
-        operation,
+        mode,
         source,
         destination,
         "--progress",
@@ -366,7 +372,7 @@ def sync_onedrive_wsl(
     wsl_dir: Path,
     *,
     dry_run: bool,
-    delete: bool,
+    mode: str = "copy",
     excludes: list[str] | None = None,
 ) -> None:
     """Run download or upload with the supplied rclone exclusions."""
@@ -400,7 +406,7 @@ def sync_onedrive_wsl(
         source,
         destination,
         dry_run=dry_run,
-        delete=delete,
+        mode=mode,
         excludes=excludes,
     )
 
@@ -410,7 +416,7 @@ def sync_onedrive_wsl(
     print(f"Source         : {source}")
     print(f"Destination    : {destination}")
     print(f"Dry run        : {dry_run}")
-    print(f"Delete         : {delete}")
+    print(f"Mode           : {mode}")
     print("=" * 72)
 
     if excludes:
@@ -460,11 +466,12 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
     parser.add_argument(
-        "--delete",
-        action="store_true",
+        "--mode",
+        choices=("copy", "sync"),
+        default="copy",
         help=(
-            "Mirror source to destination by deleting destination-only files. "
-            "Use with caution."
+            "Transfer mode: copy retains destination-only files (default); "
+            "sync mirrors the source by deleting destination-only files."
         ),
     )
 
@@ -572,7 +579,7 @@ def main() -> None:
             windows_dir=args.windows_dir,
             wsl_dir=args.wsl_dir,
             dry_run=dry_run,
-            delete=args.delete,
+            mode=args.mode,
             excludes=excludes,
         )
 
@@ -584,7 +591,7 @@ def main() -> None:
             onedrive_dir=args.onedrive_dir,
             wsl_dir=args.wsl_dir,
             dry_run=dry_run,
-            delete=args.delete,
+            mode=args.mode,
             excludes=excludes,
         )
 
